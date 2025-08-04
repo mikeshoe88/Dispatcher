@@ -1,59 +1,62 @@
+// Dispatcher Bot for Slack – Mike-Only Version
+// Posts all open Pipedrive tasks assigned to Mike (Production Team ID 53) to the specified schedule Slack channel
+
 const express = require('express');
-const bodyParser = require('body-parser');
-const fetch = require('node-fetch');
+const { App } = require('@slack/bolt');
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const DEFAULT_CHANNEL = '#dispatcher-feed'; // Change to actual channel name or pass dynamically
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
+const SCHEDULE_CHANNEL_ID = 'C098H8GU355';
 
-app.use(bodyParser.json());
-
-// Health check route
-app.get('/', (req, res) => {
-  res.send('🚀 Dispatcher is running.');
+const bolt = new App({
+  token: SLACK_BOT_TOKEN,
+  signingSecret: SLACK_SIGNING_SECRET,
 });
 
-// Trigger work order route
-app.post('/trigger-workorder', async (req, res) => {
-  const { dealTitle, productionTeam, taskType, dueDate, jobId } = req.body;
+const PRODUCTION_TEAM_ID = 53; // Mike
 
-  if (!dealTitle || !productionTeam || !taskType) {
-    return res.status(400).send('❌ Missing required fields: dealTitle, productionTeam, taskType');
-  }
+async function fetchTasksForMike() {
+  const url = `https://api.pipedrive.com/v1/activities?api_token=${PIPEDRIVE_API_TOKEN}&user_id=53&done=0`;
+  const res = await fetch(url);
+  const json = await res.json();
+  return json.data || [];
+}
 
-  const message = {
-    channel: DEFAULT_CHANNEL,
-    text: `📋 *New Work Order Created*\n*${taskType}* - *${dealTitle}* - *${productionTeam}*\n🗓️ Due: ${dueDate || 'Unspecified'}${jobId ? `\n🔗 Job ID: ${jobId}` : ''}`
-  };
+function formatTaskMessage(task) {
+  return `📌 *${task.subject}*
+👤 Contact: ${task.person_name || 'N/A'}
+🔧 Type of Service: ${task.deal?.type_of_service || 'N/A'}
+🔥 Priority: ${task.priority || 'Normal'}
+📆 Due: ${task.due_date} ${task.due_time || ''}
+🔗 Deal ID: ${task.deal_id}`;
+}
 
-  try {
-    const slackRes = await fetch('https://slack.com/api/chat.postMessage', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${SLACK_BOT_TOKEN}`
-      },
-      body: JSON.stringify(message)
+async function postScheduleToSlack() {
+  const tasks = await fetchTasksForMike();
+  if (!tasks.length) return;
+
+  for (const task of tasks) {
+    const message = formatTaskMessage(task);
+    await bolt.client.chat.postMessage({
+      channel: SCHEDULE_CHANNEL_ID,
+      text: message,
     });
-
-    const slackJson = await slackRes.json();
-
-    if (!slackJson.ok) {
-      console.error('Slack API Error:', slackJson);
-      return res.status(500).send(`Slack error: ${slackJson.error}`);
-    }
-
-    console.log(`✅ Work order posted to ${DEFAULT_CHANNEL}`);
-    res.status(200).send('✅ Work order posted.');
-  } catch (err) {
-    console.error('❌ Server Error:', err);
-    res.status(500).send('Internal server error.');
   }
+}
+
+bolt.command('/dispatch', async ({ ack, respond }) => {
+  await ack();
+  await postScheduleToSlack();
+  await respond('✅ Schedule posted for Mike.');
 });
 
-app.listen(PORT, () => {
-  console.log(`🟢 Dispatcher server listening on port ${PORT}`);
-});
+(async () => {
+  await bolt.start(port);
+  console.log(`Dispatcher (Mike Test) running on port ${port}`);
+})();
