@@ -1,0 +1,14 @@
+{
+  "name": "dispatcher",
+  "version": "1.0.0",
+  "description": "Slack bot to dispatch work orders",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^2.6.9"
+  }
+}
