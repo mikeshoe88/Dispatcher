@@ -33,8 +33,6 @@ app.event('app_mention', async ({ event, say }) => {
 
 // 🧾 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
-
-// Enable JSON parsing globally
 expressApp.use(express.json());
 
 expressApp.post('/pipedrive-task', async (req, res) => {
@@ -60,15 +58,36 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const activityDetails = await activityDetailsRes.json();
 
     let fullNote = '_No note provided_';
-    if (activityDetails.success && activityDetails.data && activityDetails.data.note) {
-      fullNote = activityDetails.data.note || fullNote;
+    let dealId = 'N/A';
+    let dealTitle = 'N/A';
+    let typeOfService = 'N/A';
+    let location = 'N/A';
+
+    if (activityDetails.success && activityDetails.data) {
+      const data = activityDetails.data;
+      fullNote = data.note || fullNote;
+      dealId = data.deal_id || 'N/A';
+
+      // Fetch deal info
+      if (dealId && dealId !== 'N/A') {
+        const dealRes = await fetch(`https://api.pipedrive.com/v1/deals/${dealId}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dealInfo = await dealRes.json();
+        if (dealInfo.success && dealInfo.data) {
+          dealTitle = dealInfo.data.title || 'N/A';
+          typeOfService = dealInfo.data['5b436b45b63857305f9691910b6567351b5517bc'] || 'N/A';
+          location = dealInfo.data.location || 'N/A';
+        }
+      }
     }
 
     const message = `📌 *New Task Created for Mike*
 • *${activity.subject}*
 📅 Due: ${activity.due_date || 'No due date'}
 📝 Note: ${fullNote}
-🔗 Deal: ${activity.deal_id || 'N/A'} | Org: ${activity.org_id || 'N/A'}`;
+🏷️ Deal ID: ${dealId} - *${dealTitle}*
+📦 Type of Service: ${typeOfService}
+📍 Location: ${location}
+✅ _Click the checkbox above to complete_`;
 
     console.log('📤 Sending message to Slack...');
     await app.client.chat.postMessage({
