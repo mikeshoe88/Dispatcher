@@ -58,6 +58,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const message = `📌 *New Task Created for Mike*
 • *${activity.subject}*
 📅 Due: ${activity.due_date || 'No due date'}
+📝 Note: ${activity.public_description || '_No note provided_'}
 🔗 Deal: ${activity.deal_id || 'N/A'} | Org: ${activity.org_id || 'N/A'}`;
 
     console.log('📤 Sending message to Slack...');
