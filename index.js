@@ -41,24 +41,24 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   console.log('📥 Received request at /pipedrive-task');
 
   try {
-    console.log('✅ Incoming Pipedrive Payload:', req.body);
     const payload = req.body;
-    const activity = payload.current;
+    console.log('✅ Incoming Pipedrive Payload:', JSON.stringify(payload, null, 2));
 
+    const activity = payload.data;
     if (!activity) {
       console.log('⚠️ No activity object found.');
       return res.status(200).send('No activity object.');
     }
 
-    if (activity.assigned_to_user_id != 53) {
-      console.log(`🔁 Task assigned to someone else: ${activity.assigned_to_user_id}`);
+    if (activity.owner_id !== 23457092) {
+      console.log(`🔁 Task assigned to someone else: ${activity.owner_id}`);
       return res.status(200).send('Not for Mike.');
     }
 
     const message = `📌 *New Task Created for Mike*
 • *${activity.subject}*
 📅 Due: ${activity.due_date || 'No due date'}
-🔗 Deal: ${activity.deal_title || 'N/A'} | Org: ${activity.org_name || 'N/A'}`;
+🔗 Deal: ${activity.deal_id || 'N/A'} | Org: ${activity.org_id || 'N/A'}`;
 
     console.log('📤 Sending message to Slack...');
     await app.client.chat.postMessage({
