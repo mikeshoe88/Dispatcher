@@ -41,6 +41,38 @@ app.event('app_mention', async ({ event, say }) => {
   await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
 });
 
+// ✅ Handle button click
+app.action('complete_task', async ({ body, ack, client }) => {
+  await ack();
+
+  const checkboxValue = body.actions[0].selected_options[0].value;
+  const activityId = checkboxValue.replace('task_', '');
+
+  // ✅ Mark task complete in Pipedrive
+  try {
+    const markComplete = await fetch(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${PIPEDRIVE_API_TOKEN}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ done: true })
+    });
+    const result = await markComplete.json();
+    console.log(`✅ Pipedrive task ${activityId} marked complete`, result);
+  } catch (err) {
+    console.error(`❌ Failed to complete task ${activityId} in PD`, err);
+  }
+
+  // ✅ Delete original message
+  try {
+    await client.chat.delete({
+      channel: body.channel.id,
+      ts: body.message.ts
+    });
+    console.log('✅ Message deleted from Slack');
+  } catch (err) {
+    console.error('❌ Failed to delete message:', err);
+  }
+});
+
 // 🧾 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
 expressApp.use(express.json());
