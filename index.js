@@ -1,11 +1,12 @@
 const { App } = require('@slack/bolt');
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+const express = require('express');
+const bodyParser = require('body-parser');
 require('dotenv').config();
 
 // 🔧 Constants
 const PORT = process.env.PORT || 3000;
-const MIKE_SLACK_ID = 'U05FPCPHJG6'; // Only Mike for now
-const SCHEDULE_CHANNEL = 'C098H8GU355'; // Mike's schedule channel
+const MIKE_SLACK_ID = 'U05FPCPHJG6';
+const SCHEDULE_CHANNEL = 'C098H8GU355';
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 
 // 🔧 Slack App Init
@@ -47,12 +48,37 @@ async function postTasksToSlack(tasks) {
   });
 }
 
-// 🚀 Start Slack Bolt App
-(async () => {
-  await app.start(PORT);
-  console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
+// 🌐 Webhook Handler
+const expressApp = express();
+expressApp.use(bodyParser.json());
 
-  // 🔁 Fetch and post tasks on boot (can move to interval or cron later)
+expressApp.post('/pipedrive-task', async (req, res) => {
+  const payload = req.body;
+  const task = payload.current;
+
+  try {
+    if (task.assigned_to_user_id === 53) {
+      const slackText = formatTask(task);
+      await app.client.chat.postMessage({
+        channel: SCHEDULE_CHANNEL,
+        text: `🆕 New Task for <@${MIKE_SLACK_ID}>:\n${slackText}`
+      });
+    }
+    res.status(200).send('Received');
+  } catch (err) {
+    console.error('❌ Error handling webhook:', err);
+    res.status(500).send('Error');
+  }
+});
+
+// 🚀 Start both Slack and Express
+(async () => {
+  await app.start(); // Internal Bolt setup, not port binding
+  expressApp.listen(PORT, () => {
+    console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
+  });
+
+  // 📦 Initial task load on boot
   const tasks = await fetchMikeTasks();
   await postTasksToSlack(tasks);
 })();
