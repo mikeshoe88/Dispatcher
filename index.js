@@ -1,5 +1,4 @@
 const { App } = require('@slack/bolt');
-const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 require('dotenv').config();
 
@@ -48,15 +47,10 @@ async function postTasksToSlack(tasks) {
   });
 }
 
-// 🚀 Start Express server
-const server = express();
-server.get('/', (req, res) => res.send('Dispatcher (Mike Test) is running'));
-server.listen(PORT, () => console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`));
-
-// 🔁 Start bot
+// 🚀 Start Slack Bolt App
 (async () => {
   await app.start(PORT);
-  console.log(`✅ Slack Bolt app started on port ${PORT}`);
+  console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
 
   // 🔁 Fetch and post tasks on boot (can move to interval or cron later)
   const tasks = await fetchMikeTasks();
