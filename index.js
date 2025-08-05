@@ -34,7 +34,10 @@ app.event('app_mention', async ({ event, say }) => {
 // 🧾 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
 
-expressApp.post('/pipedrive-task', express.urlencoded({ extended: true }), async (req, res) => {
+// Enable JSON parsing globally
+expressApp.use(express.json());
+
+expressApp.post('/pipedrive-task', async (req, res) => {
   console.log('📥 Received request at /pipedrive-task');
 
   try {
