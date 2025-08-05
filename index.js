@@ -55,10 +55,19 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       return res.status(200).send('Not for Mike.');
     }
 
+    // Fetch full activity details including the note body
+    const activityDetailsRes = await fetch(`https://api.pipedrive.com/v1/activities/${activity.id}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const activityDetails = await activityDetailsRes.json();
+
+    let fullNote = '_No note provided_';
+    if (activityDetails.success && activityDetails.data && activityDetails.data.note) {
+      fullNote = activityDetails.data.note || fullNote;
+    }
+
     const message = `📌 *New Task Created for Mike*
 • *${activity.subject}*
 📅 Due: ${activity.due_date || 'No due date'}
-📝 Note: ${activity.public_description || '_No note provided_'}
+📝 Note: ${fullNote}
 🔗 Deal: ${activity.deal_id || 'N/A'} | Org: ${activity.org_id || 'N/A'}`;
 
     console.log('📤 Sending message to Slack...');
