@@ -12,6 +12,16 @@ const MIKE_SLACK_ID = 'U05FPCPHJG6';
 const SCHEDULE_CHANNEL = 'C098H8GU355';
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 
+// 🔧 Type of Service Map
+const SERVICE_MAP = {
+  27: 'Water Mitigation',
+  28: 'Fire Cleanup',
+  29: 'Contents',
+  30: 'Biohazard',
+  31: 'General Cleaning',
+  32: 'Duct Cleaning'
+};
+
 // 🔧 Slack App Init
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -65,7 +75,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     if (activityDetails.success && activityDetails.data) {
       const data = activityDetails.data;
-      fullNote = data.note || fullNote;
+      fullNote = (data.note || fullNote).replace(/<br\/?>(\s)?/g, '\n').replace(/&nbsp;/g, ' ').trim();
       dealId = data.deal_id || 'N/A';
 
       // Fetch deal info
@@ -74,26 +84,47 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const dealInfo = await dealRes.json();
         if (dealInfo.success && dealInfo.data) {
           dealTitle = dealInfo.data.title || 'N/A';
-          typeOfService = dealInfo.data['5b436b45b63857305f9691910b6567351b5517bc'] || 'N/A';
+          const serviceId = dealInfo.data['5b436b45b63857305f9691910b6567351b5517bc'];
+          typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
           location = dealInfo.data.location || 'N/A';
         }
       }
     }
 
-    const message = `📌 *New Task Created for Mike*
-• *${activity.subject}*
-📅 Due: ${activity.due_date || 'No due date'}
-📝 Note: ${fullNote}
-🏷️ Deal ID: ${dealId} - *${dealTitle}*
-📦 Type of Service: ${typeOfService}
-📍 Location: ${location}
-✅ _Click the checkbox above to complete_`;
+    const message = {
+      channel: SCHEDULE_CHANNEL,
+      text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n📅 Due: ${activity.due_date || 'No due date'}\n📝 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n📅 Due: ${activity.due_date || 'No due date'}\n📝 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}`
+          }
+        },
+        {
+          type: 'actions',
+          elements: [
+            {
+              type: 'checkboxes',
+              action_id: 'complete_task',
+              options: [
+                {
+                  text: {
+                    type: 'mrkdwn',
+                    text: 'Mark as complete'
+                  },
+                  value: `task_${activity.id}`
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    };
 
     console.log('📤 Sending message to Slack...');
-    await app.client.chat.postMessage({
-      channel: SCHEDULE_CHANNEL,
-      text: message
-    });
+    await app.client.chat.postMessage(message);
 
     console.log('✅ Message posted to Slack');
     res.status(200).send('Task processed.');
