@@ -33,10 +33,8 @@ app.event('app_mention', async ({ event, say }) => {
 
 // 🧾 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
-expressApp.use(express.json());
-expressApp.use(express.urlencoded({ extended: true }));
 
-expressApp.post('/pipedrive-task', async (req, res) => {
+expressApp.post('/pipedrive-task', express.urlencoded({ extended: true }), async (req, res) => {
   try {
     console.log('✅ Incoming Pipedrive Payload:', req.body);
     const payload = req.body;
