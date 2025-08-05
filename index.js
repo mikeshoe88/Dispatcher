@@ -1,11 +1,9 @@
-import express from 'express';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
-import pkg from '@slack/bolt';
-
-const { App } = pkg;
-
 dotenv.config();
+
+import fetch from 'node-fetch';
+import { App, ExpressReceiver } from '@slack/bolt';
+import express from 'express';
 
 // 🔧 Constants
 const PORT = process.env.PORT || 3000;
@@ -14,11 +12,17 @@ const SCHEDULE_CHANNEL = 'C098H8GU355';
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 
 // 🔧 Slack App Init
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  endpoints: '/slack/events',
+  processBeforeResponse: true,
+  bodyParser: false
+});
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: false,
-  appToken: process.env.SLACK_APP_TOKEN
+  receiver
 });
 
 // ✅ Respond to @ mentions
@@ -27,7 +31,7 @@ app.event('app_mention', async ({ event, say }) => {
 });
 
 // 🧾 Handle Webhook Event from Pipedrive
-const expressApp = express();
+const expressApp = receiver.app;
 expressApp.use(express.json());
 
 expressApp.post('/pipedrive-task', async (req, res) => {
@@ -56,8 +60,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   }
 });
 
-// 🚀 Start Slack and Express App
+// 🚀 Start unified Bolt + Express Server
 (async () => {
   await app.start(PORT);
-  expressApp.listen(PORT, () => console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`));
+  console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
 })();
