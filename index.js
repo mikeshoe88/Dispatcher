@@ -1,7 +1,9 @@
 import express from 'express';
-import { App } from '@slack/bolt';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import pkg from '@slack/bolt';
+
+const { App } = pkg;
 
 dotenv.config();
 
