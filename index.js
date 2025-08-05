@@ -25,9 +25,12 @@ const SERVICE_MAP = {
 // 🔧 Slack App Init
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  endpoints: '/slack/events',
-  processBeforeResponse: true,
-  bodyParser: false
+  endpoints: {
+    events: '/slack/events',
+    commands: '/slack/commands',
+    actions: '/slack/interact'
+  },
+  processBeforeResponse: true
 });
 
 const app = new App({
@@ -73,7 +76,7 @@ app.action('complete_task', async ({ body, ack, client }) => {
   }
 });
 
-// 🧾 Handle Webhook Event from Pipedrive
+// 📜 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
 expressApp.use(express.json());
 
@@ -125,13 +128,13 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     const message = {
       channel: SCHEDULE_CHANNEL,
-      text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n📅 Due: ${activity.due_date || 'No due date'}\n📝 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
+      text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
       blocks: [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n📅 Due: ${activity.due_date || 'No due date'}\n📝 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}`
+            text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}`
           }
         },
         {
