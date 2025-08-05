@@ -34,9 +34,11 @@ app.event('app_mention', async ({ event, say }) => {
 // 🧾 Handle Webhook Event from Pipedrive
 const expressApp = receiver.app;
 expressApp.use(express.json());
+expressApp.use(express.urlencoded({ extended: true }));
 
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
+    console.log('✅ Incoming Pipedrive Payload:', req.body);
     const payload = req.body;
     const activity = payload.current;
 
@@ -56,7 +58,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     res.status(200).send('Task processed.');
   } catch (error) {
-    console.error('Error processing webhook:', error);
+    console.error('❌ Error processing webhook:', error);
     res.status(500).send('Server error.');
   }
 });
