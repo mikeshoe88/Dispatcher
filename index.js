@@ -1,62 +1,64 @@
-// Dispatcher Bot for Slack – Mike-Only Version
-// Posts all open Pipedrive tasks assigned to Mike (Production Team ID 53) to the specified schedule Slack channel
-
-const express = require('express');
 const { App } = require('@slack/bolt');
+const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 require('dotenv').config();
 
-const app = express();
-const port = process.env.PORT || 3000;
-
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+// 🔧 Constants
+const PORT = process.env.PORT || 3000;
+const MIKE_SLACK_ID = 'U05FPCPHJG6'; // Only Mike for now
+const SCHEDULE_CHANNEL = 'C098H8GU355'; // Mike's schedule channel
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
-const SCHEDULE_CHANNEL_ID = 'C098H8GU355';
 
-const bolt = new App({
-  token: SLACK_BOT_TOKEN,
-  signingSecret: SLACK_SIGNING_SECRET,
+// 🔧 Slack App Init
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: false,
+  appToken: process.env.SLACK_APP_TOKEN
 });
 
-const PRODUCTION_TEAM_ID = 53; // Mike
+// ✅ Respond to @ mentions
+app.event('app_mention', async ({ event, say }) => {
+  await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
+});
 
-async function fetchTasksForMike() {
-  const url = `https://api.pipedrive.com/v1/activities?api_token=${PIPEDRIVE_API_TOKEN}&user_id=53&done=0`;
+// 🔁 Fetch Mike's open tasks from Pipedrive
+async function fetchMikeTasks() {
+  const url = `https://api.pipedrive.com/v1/activities?user_id=53&done=0&api_token=${PIPEDRIVE_API_TOKEN}`;
   const res = await fetch(url);
-  const json = await res.json();
-  return json.data || [];
+  const data = await res.json();
+  return data.data || [];
 }
 
-function formatTaskMessage(task) {
-  return `📌 *${task.subject}*
-👤 Contact: ${task.person_name || 'N/A'}
-🔧 Type of Service: ${task.deal?.type_of_service || 'N/A'}
-🔥 Priority: ${task.priority || 'Normal'}
-📆 Due: ${task.due_date} ${task.due_time || ''}
-🔗 Deal ID: ${task.deal_id}`;
+// 🧱 Format task for Slack
+function formatTask(task) {
+  const dueDate = task.due_date ? `📅 Due: ${task.due_date}` : '📅 No due date';
+  return `• *${task.subject}* (${task.type})
+${dueDate} | Deal: ${task.deal_title || 'N/A'} | Org: ${task.org_name || 'N/A'}`;
 }
 
-async function postScheduleToSlack() {
-  const tasks = await fetchTasksForMike();
+// 📬 Post to Slack
+async function postTasksToSlack(tasks) {
   if (!tasks.length) return;
-
-  for (const task of tasks) {
-    const message = formatTaskMessage(task);
-    await bolt.client.chat.postMessage({
-      channel: SCHEDULE_CHANNEL_ID,
-      text: message,
-    });
-  }
+  const blocks = tasks.map(task => ({ type: 'section', text: { type: 'mrkdwn', text: formatTask(task) } }));
+  await app.client.chat.postMessage({
+    channel: SCHEDULE_CHANNEL,
+    text: `Tasks for <@${MIKE_SLACK_ID}>`,
+    blocks
+  });
 }
 
-bolt.command('/dispatch', async ({ ack, respond }) => {
-  await ack();
-  await postScheduleToSlack();
-  await respond('✅ Schedule posted for Mike.');
-});
+// 🚀 Start Express server
+const server = express();
+server.get('/', (req, res) => res.send('Dispatcher (Mike Test) is running'));
+server.listen(PORT, () => console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`));
 
+// 🔁 Start bot
 (async () => {
-  await bolt.start(port);
-  console.log(`Dispatcher (Mike Test) running on port ${port}`);
+  await app.start(PORT);
+  console.log(`✅ Slack Bolt app started on port ${PORT}`);
+
+  // 🔁 Fetch and post tasks on boot (can move to interval or cron later)
+  const tasks = await fetchMikeTasks();
+  await postTasksToSlack(tasks);
 })();
