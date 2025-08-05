@@ -1,7 +1,9 @@
-const { App } = require('@slack/bolt');
-const express = require('express');
-const bodyParser = require('body-parser');
-require('dotenv').config();
+import express from 'express';
+import { App } from '@slack/bolt';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+
+dotenv.config();
 
 // 🔧 Constants
 const PORT = process.env.PORT || 3000;
@@ -22,63 +24,38 @@ app.event('app_mention', async ({ event, say }) => {
   await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
 });
 
-// 🔁 Fetch Mike's open tasks from Pipedrive
-async function fetchMikeTasks() {
-  const url = `https://api.pipedrive.com/v1/activities?user_id=53&done=0&api_token=${PIPEDRIVE_API_TOKEN}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.data || [];
-}
-
-// 🧱 Format task for Slack
-function formatTask(task) {
-  const dueDate = task.due_date ? `📅 Due: ${task.due_date}` : '📅 No due date';
-  return `• *${task.subject}* (${task.type})
-${dueDate} | Deal: ${task.deal_title || 'N/A'} | Org: ${task.org_name || 'N/A'}`;
-}
-
-// 📬 Post to Slack
-async function postTasksToSlack(tasks) {
-  if (!tasks.length) return;
-  const blocks = tasks.map(task => ({ type: 'section', text: { type: 'mrkdwn', text: formatTask(task) } }));
-  await app.client.chat.postMessage({
-    channel: SCHEDULE_CHANNEL,
-    text: `Tasks for <@${MIKE_SLACK_ID}>`,
-    blocks
-  });
-}
-
-// 🌐 Webhook Handler
+// 🧾 Handle Webhook Event from Pipedrive
 const expressApp = express();
-expressApp.use(bodyParser.json());
+expressApp.use(express.json());
 
 expressApp.post('/pipedrive-task', async (req, res) => {
-  const payload = req.body;
-  const task = payload.current;
-
   try {
-    if (task.assigned_to_user_id === 53) {
-      const slackText = formatTask(task);
-      await app.client.chat.postMessage({
-        channel: SCHEDULE_CHANNEL,
-        text: `🆕 New Task for <@${MIKE_SLACK_ID}>:\n${slackText}`
-      });
+    const payload = req.body;
+    const activity = payload.current;
+
+    if (!activity || activity.assigned_to_user_id !== 53) {
+      return res.status(200).send('Not for Mike.');
     }
-    res.status(200).send('Received');
-  } catch (err) {
-    console.error('❌ Error handling webhook:', err);
-    res.status(500).send('Error');
+
+    const message = `📌 *New Task Created for Mike*
+• *${activity.subject}*
+📅 Due: ${activity.due_date || 'No due date'}
+🔗 Deal: ${activity.deal_title || 'N/A'} | Org: ${activity.org_name || 'N/A'}`;
+
+    await app.client.chat.postMessage({
+      channel: SCHEDULE_CHANNEL,
+      text: message
+    });
+
+    res.status(200).send('Task processed.');
+  } catch (error) {
+    console.error('Error processing webhook:', error);
+    res.status(500).send('Server error.');
   }
 });
 
-// 🚀 Start both Slack and Express
+// 🚀 Start Slack and Express App
 (async () => {
-  await app.start(); // Internal Bolt setup, not port binding
-  expressApp.listen(PORT, () => {
-    console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
-  });
-
-  // 📦 Initial task load on boot
-  const tasks = await fetchMikeTasks();
-  await postTasksToSlack(tasks);
+  await app.start(PORT);
+  expressApp.listen(PORT, () => console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`));
 })();
