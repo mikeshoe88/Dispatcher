@@ -35,12 +35,20 @@ app.event('app_mention', async ({ event, say }) => {
 const expressApp = receiver.app;
 
 expressApp.post('/pipedrive-task', express.urlencoded({ extended: true }), async (req, res) => {
+  console.log('📥 Received request at /pipedrive-task');
+
   try {
     console.log('✅ Incoming Pipedrive Payload:', req.body);
     const payload = req.body;
     const activity = payload.current;
 
-    if (!activity || activity.assigned_to_user_id !== 53) {
+    if (!activity) {
+      console.log('⚠️ No activity object found.');
+      return res.status(200).send('No activity object.');
+    }
+
+    if (activity.assigned_to_user_id != 53) {
+      console.log(`🔁 Task assigned to someone else: ${activity.assigned_to_user_id}`);
       return res.status(200).send('Not for Mike.');
     }
 
@@ -49,11 +57,13 @@ expressApp.post('/pipedrive-task', express.urlencoded({ extended: true }), async
 📅 Due: ${activity.due_date || 'No due date'}
 🔗 Deal: ${activity.deal_title || 'N/A'} | Org: ${activity.org_name || 'N/A'}`;
 
+    console.log('📤 Sending message to Slack...');
     await app.client.chat.postMessage({
       channel: SCHEDULE_CHANNEL,
       text: message
     });
 
+    console.log('✅ Message posted to Slack');
     res.status(200).send('Task processed.');
   } catch (error) {
     console.error('❌ Error processing webhook:', error);
