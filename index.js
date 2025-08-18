@@ -8,7 +8,7 @@ const { App, ExpressReceiver } = bolt;
 import express from 'express';
 import crypto from 'crypto';
 
-// 🔧 Env / constants
+// ENV / constants
 const PORT = process.env.PORT || 3000;
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const SIGNING_SECRET = process.env.WO_QR_SECRET; // HMAC secret for QR links
@@ -19,7 +19,7 @@ if (!process.env.SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
 if (!PIPEDRIVE_API_TOKEN) throw new Error('Missing PIPEDRIVE_API_TOKEN');
 if (!SIGNING_SECRET) throw new Error('Missing WO_QR_SECRET');
 
-// 🔧 Optional: map Pipedrive service enum -> label
+// Optional: map Pipedrive service enum -> label
 const SERVICE_MAP = {
   27: 'Water Mitigation',
   28: 'Fire Cleanup',
@@ -29,7 +29,7 @@ const SERVICE_MAP = {
   32: 'Duct Cleaning',
 };
 
-// 🔧 Slack app init
+// Slack app init
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
@@ -51,7 +51,7 @@ app.event('app_mention', async ({ event, say }) => {
   await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
 });
 
-// ✅ Slack checkbox → complete PD activity
+// Slack checkbox → complete PD activity
 app.action('complete_task', async ({ body, ack, client }) => {
   await ack();
   const checkboxValue = body.actions?.[0]?.selected_options?.[0]?.value;
@@ -78,18 +78,15 @@ app.action('complete_task', async ({ body, ack, client }) => {
   }
 });
 
-// 📬 Pipedrive webhook → post task to Slack
+// Express app from Bolt receiver
 const expressApp = receiver.app;
 expressApp.use(express.json());
 
+// Pipedrive webhook → post task to Slack
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
-    const payload = req.body;
-    const activity = payload?.data;
+    const activity = req.body?.data;
     if (!activity) return res.status(200).send('No activity.');
-
-    // Optional: restrict during testing
-    // if (activity.owner_id !== 23457092) return res.status(200).send('Not target owner.');
 
     // Get full activity info
     const aRes = await fetch(
@@ -159,21 +156,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   }
 });
 
-// --- HMAC helpers (base64url)
+// HMAC helpers (base64url)
 const b64url = (buf) =>
   Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
 
 const sign = (raw) => b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
-
 function verify(raw, sig) {
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sign(raw)), Buffer.from(String(sig)));
-  } catch {
-    return false;
-  }
+  try { return crypto.timingSafeEqual(Buffer.from(sign(raw)), Buffer.from(String(sig))); }
+  catch { return false; }
 }
 
-// ✅ QR scan → complete task in PD (+ optional Slack ping)
+// QR scan → complete task in PD (+ optional Slack ping)
 expressApp.get('/wo/complete', async (req, res) => {
   try {
     const { aid, did, cid, exp, sig } = req.query || {};
@@ -185,7 +178,6 @@ expressApp.get('/wo/complete', async (req, res) => {
     const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
-    // Mark done in PD
     const pdUrl = `https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`;
     const pdPayload = { done: true, marked_as_done_time: new Date().toISOString() };
     const pdResp = await fetch(pdUrl, {
@@ -196,7 +188,6 @@ expressApp.get('/wo/complete', async (req, res) => {
     const pdJson = await pdResp.json();
     const ok = pdJson && pdJson.success;
 
-    // Slack confirmation
     const channel = cid || SCHEDULE_CHANNEL;
     if (channel) {
       const text = ok
@@ -230,7 +221,7 @@ export function makeSignedQRUrl({ base, aid, did = '', cid = '', ttlSeconds = 7 
   return `${base}?${params.toString()}`;
 }
 
-// 🚀 Start
+// Start
 (async () => {
   await app.start(PORT);
   console.log(`✅ Dispatcher running on port ${PORT}`);
