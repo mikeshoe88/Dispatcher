@@ -142,25 +142,19 @@ function makeSignedCompleteUrl({ aid, did = '', cid = '', ttlSeconds = 7 * 24 * 
 /* ========= Channel resolution ========= */
 const channelCache = new Map(); // key: dealId -> channelId
 
-// Try several naming patterns, including plain numeric channel names (e.g., "135")
+// Match exact, suffix (e.g., "*-deal135"), and fuzzy form of "deal{ID}" even with prefixes.
 async function findDealChannelId(dealId) {
   if (!dealId) return null;
   const key = String(dealId);
   if (channelCache.has(key)) return channelCache.get(key);
 
-  const candidates = [
-    `deal${key}`,
-    `deal-${key}`,
-    `deal_${key}`,
-    `${key}`,          // plain number channel like "135"
-    `${key}-deal`,
-    `${key}_deal`,
-    `job${key}`,
-    `job-${key}`,
-    `job_${key}`,
+  const tokens = [
+    `deal${key}`, `deal-${key}`, `deal_${key}`,
+    `${key}`, `${key}-deal`, `${key}_deal`,
+    `job${key}`, `job-${key}`, `job_${key}`,
   ];
 
-  console.log(`[WO] searching Slack channels for deal ${key}; candidates: ${candidates.join(', ')}`);
+  console.log(`[WO] searching Slack channels for deal ${key}; tokens: ${tokens.join(', ')}`);
 
   let cursor;
   const seen = new Set();
@@ -173,11 +167,17 @@ async function findDealChannelId(dealId) {
     });
     const chans = resp.channels || [];
     for (const c of chans) {
-      if (!c || !c.id || !c.name) continue;
+      if (!c?.id || !c?.name) continue;
       if (seen.has(c.id)) continue;
       seen.add(c.id);
 
-      if (candidates.includes(c.name)) {
+      const exact = tokens.includes(c.name);
+      const suffix = tokens.some(t => c.name.endsWith(t));
+
+      const strip = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const fuzzy = strip(c.name).includes(strip(`deal${key}`)); // e.g., "tammiehalldeal135"
+
+      if (exact || suffix || fuzzy) {
         console.log(`[WO] matched channel "${c.name}" (${c.id}) for deal ${key}`);
         channelCache.set(key, c.id);
         return c.id;
@@ -196,6 +196,7 @@ async function ensureBotInChannel(channelId) {
   try {
     await app.client.conversations.join({ channel: channelId });
   } catch (e) {
+    // Private channels require invite; already-in is fine; ignore benign errors.
     const code = e?.data?.error || e?.message;
     if (code && !['method_not_supported_for_channel_type', 'is_archived', 'already_in_channel', 'not_in_channel'].includes(code)) {
       console.log('[WO] join note:', code);
@@ -203,7 +204,7 @@ async function ensureBotInChannel(channelId) {
   }
 }
 
-// allowDefault = false to enforce strict routing
+// allowDefault = false to enforce strict routing (no fallback)
 async function resolveChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }) {
   const byDeal = await findDealChannelId(dealId);
   if (byDeal) return byDeal;
@@ -287,10 +288,7 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }) {
   if (!dealId || dealId === 'N/A') return;
   const form = new FormData();
   form.append('deal_id', String(dealId));
-  form.append('file', pdfBuffer, {
-    filename: filename || 'workorder.pdf',
-    contentType: 'application/pdf',
-  });
+  form.append('file', pdfBuffer, { filename: filename || 'workorder.pdf', contentType: 'application/pdf' });
   const resp = await fetch(
     `https://api.pipedrive.com/v1/files?api_token=${PIPEDRIVE_API_TOKEN}`,
     { method: 'POST', headers: form.getHeaders(), body: form }
