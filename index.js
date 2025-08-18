@@ -20,6 +20,13 @@ const DEFAULT_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 const BASE_URL = process.env.BASE_URL; // e.g. https://dispatcher-xxx.up.railway.app
 const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // guard for /pipedrive-task
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false'; // set to 'false' to disable fallback
+const PD_PRODUCTION_TEAM_FIELD_KEY = process.env.PD_PRODUCTION_TEAM_FIELD_KEY || ''; // <-- set this!
+
+// Feature toggles (set to 'false' to turn off)
+const ENABLE_PD_FILE_UPLOAD = process.env.ENABLE_PD_FILE_UPLOAD !== 'false';            // default: true
+const ENABLE_PD_NOTE        = process.env.ENABLE_PD_NOTE        !== 'false';            // default: true
+const ENABLE_SLACK_PDF_UPLOAD = process.env.ENABLE_SLACK_PDF_UPLOAD !== 'false';        // default: true
+const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';    // default: true
 
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
@@ -49,14 +56,15 @@ const PRODUCTION_TEAM_MAP = {
   54: 'Kim',
 };
 
-// Slack user IDs (optional DM)
-const SLACK_USER_IDS = {
-  Mike: 'U05FPCPHJG6',
-  Kim: 'U05FYG3EMHS',
-  Hector: 'U05TUQ48UBU',
-  Sebastian: 'U07827VLWNL',
-  Anastacio: 'U07AB7A4UNS',
-  // add others as needed
+// === Assignee Channel Overrides ===
+// If the deal’s Production Team enum is one of these IDs,
+// post a copy of the W.O. in the mapped channel, and manage reassignment deletes here.
+const PRODUCTION_TEAM_TO_CHANNEL = {
+  // Anastacio:
+  52: 'C09BA0XUAV7',
+  // Add others as you create their channels:
+  // 53: 'Cxxxxxxxxxx', // Mike
+  // 50: 'Cyyyyyyyyyy', // Hector
 };
 
 /* ========= Slack App (Bolt) ========= */
@@ -139,7 +147,7 @@ function makeSignedCompleteUrl({ aid, did = '', cid = '', ttlSeconds = 7 * 24 * 
   return `${BASE_URL}/wo/complete?${params.toString()}`;
 }
 
-/* ========= Channel resolution ========= */
+/* ========= Channel resolution (deal) ========= */
 const channelCache = new Map(); // key: dealId -> channelId
 
 // Match exact, suffix (e.g., "*-deal135"), and fuzzy form of "deal{ID}" even with prefixes.
@@ -173,7 +181,6 @@ async function findDealChannelId(dealId) {
 
       const exact = tokens.includes(c.name);
       const suffix = tokens.some(t => c.name.endsWith(t));
-
       const strip = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
       const fuzzy = strip(c.name).includes(strip(`deal${key}`)); // e.g., "tammiehalldeal135"
 
@@ -205,20 +212,28 @@ async function ensureBotInChannel(channelId) {
 }
 
 // allowDefault = false to enforce strict routing (no fallback)
-async function resolveChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }) {
+async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }) {
   const byDeal = await findDealChannelId(dealId);
   if (byDeal) return byDeal;
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-function resolveAssigneeSlackId({ productionTeamId, productionTeamName }) {
-  const name = productionTeamName || (productionTeamId ? PRODUCTION_TEAM_MAP[productionTeamId] : null);
-  if (!name) return null;
-  return SLACK_USER_IDS[name] || null;
+/* ========= Assignee channel resolution (Production Team → channel) ========= */
+function resolveAssigneeInfoFromDeal(deal) {
+  if (!deal || !PD_PRODUCTION_TEAM_FIELD_KEY) return { teamId: null, teamName: null, channelId: null };
+  const teamId = deal[PD_PRODUCTION_TEAM_FIELD_KEY] || null; // enum ID number
+  const teamName = teamId ? PRODUCTION_TEAM_MAP[teamId] || `Team ${teamId}` : null;
+  const channelId = teamId ? PRODUCTION_TEAM_TO_CHANNEL[teamId] || null : null;
+  return { teamId, teamName, channelId };
 }
 
+/* ========= Simple in-memory registry to manage reassignment deletes ========= */
+// We only delete in the *assignee* channel (job channel is permanent history).
+// Map: activityId -> { assigneeChannelId, messageTs }
+const ASSIGNEE_POSTS = new Map();
+
 /* ========= Build Work Order PDF (returns Buffer) ========= */
-async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR }) {
+async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName }) {
   const completeUrl = makeSignedCompleteUrl({
     aid: String(activity.id),
     did: activity.deal_id ? String(activity.deal_id) : '',
@@ -247,6 +262,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.text(`Deal: ${dealTitle || '-'}`);
   doc.text(`Type of Service: ${typeOfService || '-'}`);
   doc.text(`Location: ${location || '-'}`);
+  if (assigneeName) doc.text(`Assigned To: ${assigneeName}`);
   doc.moveDown(0.5);
 
   const rawNote = (activity.note || '')
@@ -312,18 +328,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const activity = req.body?.data || req.body?.current || null; // supports PD v1/v2 payloads
     if (!activity) return res.status(200).send('No activity.');
 
-    // If later you subscribe to update.activity, guard noisy updates here:
-    // if (action === 'updated') {
-    //   const prev = req.body?.previous || {};
-    //   const curr = req.body?.current || req.body?.data || {};
-    //   const fieldsThatMatter = ['subject', 'due_date', 'due_time', 'note'];
-    //   const changed = fieldsThatMatter.some(f => String(prev?.[f] || '') !== String(curr?.[f] || ''));
-    //   if (!changed) {
-    //     console.log('[WO] update ignored (no relevant field changes)');
-    //     return res.status(200).send('Ignored update');
-    //   }
-    // }
-
     // Fetch full activity details
     const aRes = await fetch(
       `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`
@@ -336,6 +340,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     let typeOfService = 'N/A';
     let location = 'N/A';
     let productionTeamId = null;
+    let productionTeamName = null;
+    let assigneeChannelId = null;
 
     if (aJson?.success && aJson.data) {
       const data = aJson.data;
@@ -354,146 +360,178 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
           location = deal.location || 'N/A';
 
-          // If you store Production Team enum on the deal, read it here:
-          // productionTeamId = deal['<your_production_team_field_key>'] || null;
+          // Production Team (enum on Deal)
+          const assigneeInfo = resolveAssigneeInfoFromDeal(deal);
+          productionTeamId = assigneeInfo.teamId;
+          productionTeamName = assigneeInfo.teamName;
+          assigneeChannelId = assigneeInfo.channelId;
         }
       }
     }
 
-    const slackChannelId = await resolveChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
-    console.log(`[WO] using Slack channel ${slackChannelId} for deal ${dealId}`);
+    // Resolve the Job (deal) channel
+    const dealChannelId = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
+    console.log(`[WO] using Deal channel ${dealChannelId} for deal ${dealId}`);
 
-    // Optional DM target (default to Mike during testing)
-    const assigneeSlackId = resolveAssigneeSlackId({
-      productionTeamId,
-      productionTeamName: productionTeamId ? PRODUCTION_TEAM_MAP[productionTeamId] : 'Mike',
+    // --- Build PDF once (with assignee name on the doc) ---
+    const pdfBuffer = await buildWorkOrderPdfBuffer({
+      activity: aJson.data,
+      dealTitle,
+      typeOfService,
+      location,
+      channelForQR: dealChannelId || DEFAULT_CHANNEL, // QR confirm posts to job channel
+      assigneeName: productionTeamName,
     });
+    const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g, '_').slice(0, 60);
+    const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
+    const scheduledText = [activity.due_date, activity.due_time].filter(Boolean).join(' ') || 'No due date';
 
-    // Post Slack task card
-    if (slackChannelId) {
-      await ensureBotInChannel(slackChannelId);
-
-      const message = {
-        channel: slackChannelId,
-        text:
-          `📌 *New Task*\n• *${activity.subject}*` +
-          `\n🗕️ Due: ${[activity.due_date, activity.due_time].filter(Boolean).join(' ') || 'No due date'}` +
-          `\n📜 Note: ${fullNote}` +
-          `\n🏷️ Deal ID: ${dealId} - *${dealTitle}*` +
-          `\n📦 Type of Service: ${typeOfService}` +
-          `\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
-        blocks: [
+    // --- Compose Slack blocks (reuse for both channels) ---
+    const baseBlocks = [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text:
+            `📌 *New Task*\n• *${activity.subject || '-'}*` +
+            `\n🗕️ Due: ${scheduledText}` +
+            `\n📜 Note: ${fullNote}` +
+            `\n🏷️ Deal ID: ${dealId} - *${dealTitle}*` +
+            `\n📦 Type of Service: ${typeOfService}` +
+            `\n📍 Location: ${location}` +
+            (productionTeamName ? `\n👷 Assigned To: ${productionTeamName}` : ''),
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
           {
-            type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text:
-                `📌 *New Task*\n• *${activity.subject}*` +
-                `\n🗕️ Due: ${[activity.due_date, activity.due_time].filter(Boolean).join(' ') || 'No due date'}` +
-                `\n📜 Note: ${fullNote}` +
-                `\n🏷️ Deal ID: ${dealId} - *${dealTitle}*` +
-                `\n📦 Type of Service: ${typeOfService}` +
-                `\n📍 Location: ${location}`,
-            },
-          },
-          {
-            type: 'actions',
-            elements: [
+            type: 'checkboxes',
+            action_id: 'complete_task',
+            options: [
               {
-                type: 'checkboxes',
-                action_id: 'complete_task',
-                options: [
-                  {
-                    text: { type: 'mrkdwn', text: 'Mark as complete' },
-                    value: `task_${activity.id}`,
-                  },
-                ],
+                text: { type: 'mrkdwn', text: 'Mark as complete' },
+                value: `task_${activity.id}`,
               },
             ],
           },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Open Work Order PDF' },
+            url: `${BASE_URL}/wo/pdf?aid=${encodeURIComponent(activity.id)}`,
+          },
         ],
-      };
+      },
+    ];
 
-      await app.client.chat.postMessage(message);
-      console.log('[WO] task card posted');
-    } else {
-      console.warn(`[WO] No Slack channel found; skipping Slack post for deal ${dealId}`);
-    }
-
-    // Build & upload PDF (Slack + Pipedrive)
-    try {
-      console.log('[WO] building PDF for activity', activity.id);
-      const pdfBuffer = await buildWorkOrderPdfBuffer({
-        activity: aJson.data,
-        dealTitle,
-        typeOfService,
-        location,
-        channelForQR: slackChannelId || DEFAULT_CHANNEL,
+    /* ===== 1) Post to DEAL (job) channel — persistent history ===== */
+    if (dealChannelId) {
+      await ensureBotInChannel(dealChannelId);
+      const dealMsg = await app.client.chat.postMessage({
+        channel: dealChannelId,
+        text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`,
+        blocks: baseBlocks,
       });
+      console.log('[WO] deal task card posted in', dealChannelId);
 
-      const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g, '_').slice(0, 60);
-      const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
-
-      if (slackChannelId) {
-        console.log('[WO] uploading to Slack channel', slackChannelId, 'filename', filename);
+      if (ENABLE_SLACK_PDF_UPLOAD) {
         await uploadPdfToSlack({
-          channel: slackChannelId,
+          channel: dealChannelId,
           filename,
           pdfBuffer,
           title: `Work Order — ${activity.subject || ''}`,
           initialComment: '📄 Work Order PDF (scan QR to complete)',
         });
-        console.log('[WO] Slack upload done');
+        console.log('[WO] Slack PDF uploaded to deal channel');
+      } else {
+        console.log('[WO] Slack PDF upload disabled by env (deal channel)');
+      }
+    } else {
+      console.warn(`[WO] No Slack deal channel found; skipping job-channel post for deal ${dealId}`);
+    }
+
+    /* ===== 2) Post to ASSIGNEE channel — reassignment managed here ===== */
+    // Only if we know the Production Team and mapped channel
+    if (assigneeChannelId) {
+      await ensureBotInChannel(assigneeChannelId);
+
+      const prev = ASSIGNEE_POSTS.get(String(activity.id));
+      if (prev?.assigneeChannelId && prev.assigneeChannelId !== assigneeChannelId && ENABLE_DELETE_ON_REASSIGN) {
+        try {
+          await app.client.chat.delete({ channel: prev.assigneeChannelId, ts: prev.messageTs });
+          console.log(`[WO] deleted previous assignee message from ${prev.assigneeChannelId} (reassigned)`);
+        } catch (e) {
+          console.warn('[WO] failed to delete previous assignee message (ok):', e?.data || e?.message || e);
+        }
       }
 
-      console.log('[WO] uploading to Pipedrive deal', dealId);
-      await uploadPdfToPipedrive({ dealId, pdfBuffer, filename });
-      console.log('[WO] PD file upload done');
+      const assigneeMsg = await app.client.chat.postMessage({
+        channel: assigneeChannelId,
+        text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`,
+        blocks: baseBlocks,
+      });
+      console.log('[WO] assignee task card posted in', assigneeChannelId);
 
+      ASSIGNEE_POSTS.set(String(activity.id), {
+        assigneeChannelId,
+        messageTs: assigneeMsg.ts,
+      });
+
+      if (ENABLE_SLACK_PDF_UPLOAD) {
+        await uploadPdfToSlack({
+          channel: assigneeChannelId,
+          filename,
+          pdfBuffer,
+          title: `Work Order — ${activity.subject || ''}`,
+          initialComment: '📄 Work Order PDF (scan QR to complete)',
+        });
+        console.log('[WO] Slack PDF uploaded to assignee channel');
+      } else {
+        console.log('[WO] Slack PDF upload disabled by env (assignee channel)');
+      }
+    } else {
+      console.log('[WO] no assignee channel (missing PD_PRODUCTION_TEAM_FIELD_KEY or mapping). Skipping assignee channel.');
+    }
+
+    /* ===== 3) Pipedrive attachments / notes (toggleable) ===== */
+    if (ENABLE_PD_FILE_UPLOAD) {
+      try {
+        await uploadPdfToPipedrive({ dealId, pdfBuffer, filename });
+        console.log('[WO] PD file upload done');
+      } catch (e) {
+        console.error('[WO] PD file upload failed:', e);
+      }
+    } else {
+      console.log('[WO] PD file upload disabled by env');
+    }
+
+    if (ENABLE_PD_NOTE) {
       const completeUrl = makeSignedCompleteUrl({
         aid: String(activity.id),
         did: dealId !== 'N/A' ? String(dealId) : '',
-        cid: slackChannelId || DEFAULT_CHANNEL,
+        cid: dealChannelId || DEFAULT_CHANNEL,
       });
-      console.log('[WO] posting PD note with QR link');
       await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deal_id: dealId, content: `Work Order PDF attached.\nScan to complete: ${completeUrl}` }),
+        body: JSON.stringify({
+          deal_id: dealId,
+          content: `Work Order posted to Slack.\nScan to complete: ${completeUrl}`,
+        }),
       });
       console.log('[WO] PD note posted');
-
-      // Optional: DM assignee a copy
-      if (assigneeSlackId) {
-        try {
-          await app.client.chat.postMessage({
-            channel: assigneeSlackId,
-            text: `You were assigned a new Work Order for deal ${dealId} — *${dealTitle}*.`,
-          });
-          await uploadPdfToSlack({
-            channel: assigneeSlackId,
-            filename,
-            pdfBuffer,
-            title: `Work Order — ${activity.subject || ''}`,
-            initialComment: '📄 Work Order PDF (scan QR to complete)',
-          });
-          console.log('[WO] DM sent to lead', assigneeSlackId);
-        } catch (dmErr) {
-          console.warn('DM to assignee failed (ok if disabled/no scope):', dmErr?.data || dmErr?.message || dmErr);
-        }
-      }
-    } catch (e) {
-      console.error('PDF/QR upload failed:', e);
+    } else {
+      console.log('[WO] PD note disabled by env');
     }
 
-    res.status(200).send('OK');
+    return res.status(200).send('OK');
   } catch (error) {
     console.error('Webhook error:', error);
     res.status(500).send('Server error.');
   }
 });
 
-/* ========= QR scan → complete task in Pipedrive (+ Slack ping) ========= */
+/* ========= QR scan → complete task in Pipedrive (+ Slack ping to job channel) ========= */
 expressApp.get('/wo/complete', async (req, res) => {
   try {
     const { aid, did, cid, exp, sig } = req.query || {};
@@ -513,7 +551,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     const pdJson = await pdResp.json();
     const ok = pdJson && pdJson.success;
 
-    const channel = cid || DEFAULT_CHANNEL;
+    const channel = cid || DEFAULT_CHANNEL; // confirm in job channel
     if (channel) {
       const text = ok
         ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}.`
@@ -598,6 +636,7 @@ expressApp.get('/wo/pdf', async (req, res) => {
     if (!success || !data) return res.status(404).send('Activity not found');
 
     let dealTitle = 'N/A', typeOfService = 'N/A', location = 'N/A';
+    let assigneeName = null;
     const dealId = data.deal_id;
     if (dealId) {
       const dRes = await fetch(
@@ -609,16 +648,21 @@ expressApp.get('/wo/pdf', async (req, res) => {
         const serviceId = dj.data['5b436b45b63857305f9691910b6567351b5517bc'];
         typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
         location = dj.data.location || 'N/A';
+        if (PD_PRODUCTION_TEAM_FIELD_KEY && dj.data[PD_PRODUCTION_TEAM_FIELD_KEY]) {
+          const tid = dj.data[PD_PRODUCTION_TEAM_FIELD_KEY];
+          assigneeName = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
+        }
       }
     }
 
-    const channelIdForQr = await resolveChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
+    const channelIdForQr = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
     const pdfBuffer = await buildWorkOrderPdfBuffer({
       activity: data,
       dealTitle,
       typeOfService,
       location,
       channelForQR: channelIdForQr || DEFAULT_CHANNEL,
+      assigneeName,
     });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
