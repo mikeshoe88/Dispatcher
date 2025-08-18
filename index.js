@@ -1,4 +1,4 @@
-// server.js
+// index.js
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -210,19 +210,8 @@ expressApp.get('/wo/complete', async (req, res) => {
   }
 });
 
-// (Optional) helper to generate signed QR URLs server-side
-export function makeSignedQRUrl({ base, aid, did = '', cid = '', ttlSeconds = 7 * 24 * 60 * 60 }) {
-  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
-  const raw = `${aid}.${did}.${cid}.${exp}`;
-  const sig = sign(raw);
-  const params = new URLSearchParams({ aid, exp: String(exp), sig });
-  if (did) params.set('did', String(did));
-  if (cid) params.set('cid', String(cid));
-  return `${base}?${params.toString()}`;
-}
-
 // Start
 (async () => {
-  await app.start(PORT);
+  await app.start(PORT); // Bolt spins up the HTTP server on PORT
   console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
