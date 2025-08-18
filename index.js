@@ -21,7 +21,6 @@ const BASE_URL = process.env.BASE_URL; // e.g. https://dispatcher-xxx.up.railway
 const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // guard for /pipedrive-task
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false'; // set to 'false' to disable fallback
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // hard route for debugging
-const PD_PRODUCTION_TEAM_FIELD_KEY = process.env.PD_PRODUCTION_TEAM_FIELD_KEY || ''; // Deal custom field key for Production Team
 
 // Feature toggles (set to 'false' to turn off)
 const ENABLE_PD_FILE_UPLOAD = process.env.ENABLE_PD_FILE_UPLOAD !== 'false';            // default: true
@@ -65,13 +64,15 @@ const PRODUCTION_TEAM_MAP = {
   54: 'Kim',
 };
 
-// Assignee Channel Overrides (Production Team enum ID → Slack channel ID)
+/* ========= Production Team custom field key (from you) ========= */
+const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
+
+/* ========= Assignee Channel Overrides (Production Team enum ID → Slack channel) ========= */
 const PRODUCTION_TEAM_TO_CHANNEL = {
-  // Anastacio:
-  52: 'C09BA0XUAV7',
-  // Add others as you create their channels:
-  // 53: 'Cxxxxxxxxxx', // Mike
-  // 50: 'Cyyyyyyyyyy', // Hector
+  52: 'C09BA0XUAV7', // Anastacio
+  // 53: '<MIKE_CHANNEL_ID>', // Mike (add when ready)
+  // 50: '<HECTOR_CHANNEL_ID>', // Hector
+  // etc...
 };
 
 /* ========= Slack App (Bolt) ========= */
@@ -80,7 +81,6 @@ const receiver = new ExpressReceiver({
   endpoints: { events: '/slack/events', commands: '/slack/commands', actions: '/slack/interact' },
   processBeforeResponse: true,
 });
-
 const app = new App({ token: SLACK_BOT_TOKEN, signingSecret: SLACK_SIGNING_SECRET, receiver });
 
 /* ========= Mentions ping ========= */
@@ -119,10 +119,10 @@ expressApp.use(express.json());
 expressApp.get('/', (_req, res) => res.status(200).send('Dispatcher OK'));
 expressApp.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-/* ========= HMAC helpers for signed QR links ========= */
+/* ========= Helpers ========= */
+// HMAC helpers for signed QR links
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const sign = (raw) => b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
-
 function verify(raw, sig) {
   try {
     const a = Buffer.from(sign(raw));
@@ -134,7 +134,7 @@ function verify(raw, sig) {
   }
 }
 
-/* ========= Signed URL builder for auto-complete ========= */
+// Signed URL builder for auto-complete
 function makeSignedCompleteUrl({ aid, did = '', cid = '', ttlSeconds = 7 * 24 * 60 * 60 }) {
   const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
   const raw = `${aid}.${did}.${cid}.${exp}`;
@@ -143,6 +143,29 @@ function makeSignedCompleteUrl({ aid, did = '', cid = '', ttlSeconds = 7 * 24 * 
   if (did) params.set('did', String(did));
   if (cid) params.set('cid', String(cid));
   return `${BASE_URL}/wo/complete?${params.toString()}`;
+}
+
+// Safe URL builder for Slack button (prevents invalid_blocks)
+function buildPdfUrl(aid) {
+  try {
+    const base = new URL(String(BASE_URL).trim()); // throws if invalid
+    const u = new URL('/wo/pdf', base);
+    u.searchParams.set('aid', String(aid));
+    const href = u.toString();
+    if (!/^https?:\/\//i.test(href)) return null;
+    return href;
+  } catch (e) {
+    console.error('[WO] buildPdfUrl error:', e?.message || e);
+    return null;
+  }
+}
+
+// Normalize PD v2 time shapes (string or { value })
+function getTimeField(v) {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'object' && v.value) return String(v.value);
+  return '';
 }
 
 /* ========= Deal channel resolution ========= */
@@ -213,17 +236,17 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-/* ========= Assignee channel resolution (Production Team → channel) ========= */
+/* ========= Assignee (Production Team) resolution ========= */
 function resolveAssigneeInfoFromDeal(deal) {
-  if (!deal || !PD_PRODUCTION_TEAM_FIELD_KEY) return { teamId: null, teamName: null, channelId: null };
-  const teamId = deal[PD_PRODUCTION_TEAM_FIELD_KEY] || null; // enum ID number
+  if (!deal) return { teamId: null, teamName: null, channelId: null };
+  const teamId = deal[PRODUCTION_TEAM_FIELD_KEY] || null; // enum ID number
   const teamName = teamId ? PRODUCTION_TEAM_MAP[teamId] || `Team ${teamId}` : null;
   const channelId = teamId ? PRODUCTION_TEAM_TO_CHANNEL[teamId] || null : null;
   return { teamId, teamName, channelId };
 }
 
 /* ========= In-memory registry to manage reassignment deletes ========= */
-// We delete only in the *assignee* channel (job channel is permanent history).
+// Only delete the *assignee* channel message on reassignment (job channel is permanent).
 // Map: activityId -> { assigneeChannelId, messageTs }
 const ASSIGNEE_POSTS = new Map();
 
@@ -249,7 +272,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align: 'center' });
   doc.moveDown(1);
 
-  const scheduled = [activity.due_date, activity.due_time].filter(Boolean).join(' ').trim();
+  const scheduled = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ').trim();
 
   doc.fillColor('#000').fontSize(12);
   doc.text(`Task: ${activity.subject || '-'}`);
@@ -418,9 +441,27 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g, '_').slice(0, 60);
     const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
-    const scheduledText = [activity.due_date, activity.due_time].filter(Boolean).join(' ') || 'No due date';
+    const scheduledText = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ') || 'No due date';
 
     // Slack blocks shared
+    const pdfUrl = buildPdfUrl(activity.id);
+    const actionElements = [
+      {
+        type: 'checkboxes',
+        action_id: 'complete_task',
+        options: [{ text: { type: 'mrkdwn', text: 'Mark as complete' }, value: `task_${activity.id}` }],
+      },
+    ];
+    if (pdfUrl) {
+      actionElements.push({
+        type: 'button',
+        text: { type: 'plain_text', text: 'Open Work Order PDF' },
+        url: pdfUrl,
+      });
+    } else {
+      console.warn('[WO] Skipping PDF button due to invalid BASE_URL:', BASE_URL);
+    }
+
     const baseBlocks = [
       {
         type: 'section',
@@ -436,17 +477,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             (productionTeamName ? `\n👷 Assigned To: ${productionTeamName}` : ''),
         },
       },
-      {
-        type: 'actions',
-        elements: [
-          {
-            type: 'checkboxes',
-            action_id: 'complete_task',
-            options: [{ text: { type: 'mrkdwn', text: 'Mark as complete' }, value: `task_${activity.id}` }],
-          },
-          { type: 'button', text: { type: 'plain_text', text: 'Open Work Order PDF' }, url: `${BASE_URL}/wo/pdf?aid=${encodeURIComponent(activity.id)}` },
-        ],
-      },
+      { type: 'actions', elements: actionElements },
     ];
 
     // 1) Deal (job) channel — persistent
@@ -531,7 +562,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         console.log('[WO] Slack PDF upload disabled by env (assignee channel)');
       }
     } else {
-      console.log('[WO] no assignee channel (missing PD_PRODUCTION_TEAM_FIELD_KEY or mapping). Skipping assignee channel.');
+      console.log('[WO] no assignee channel (missing mapping or field value). Skipping assignee channel.');
     }
 
     // 3) Pipedrive attachments / notes (toggleable)
@@ -686,10 +717,8 @@ expressApp.get('/wo/pdf', async (req, res) => {
         const serviceId = dj.data['5b436b45b63857305f9691910b6567351b5517bc'];
         typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
         location = dj.data.location || 'N/A';
-        if (PD_PRODUCTION_TEAM_FIELD_KEY && dj.data[PD_PRODUCTION_TEAM_FIELD_KEY]) {
-          const tid = dj.data[PD_PRODUCTION_TEAM_FIELD_KEY];
-          assigneeName = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
-        }
+        const tid = dj.data[PRODUCTION_TEAM_FIELD_KEY];
+        if (tid) assigneeName = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
       }
     }
 
