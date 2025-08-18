@@ -1,3 +1,4 @@
+// server.js
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -5,102 +6,96 @@ import fetch from 'node-fetch';
 import bolt from '@slack/bolt';
 const { App, ExpressReceiver } = bolt;
 import express from 'express';
+import crypto from 'crypto';
 
-// 🔧 Constants
+// 🔧 Env / constants
 const PORT = process.env.PORT || 3000;
-const MIKE_SLACK_ID = 'U05FPCPHJG6';
-const SCHEDULE_CHANNEL = 'C098H8GU355';
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
+const SIGNING_SECRET = process.env.WO_QR_SECRET; // HMAC secret for QR links
+const SCHEDULE_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 
-// 🔧 Type of Service Map
+if (!process.env.SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
+if (!process.env.SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
+if (!PIPEDRIVE_API_TOKEN) throw new Error('Missing PIPEDRIVE_API_TOKEN');
+if (!SIGNING_SECRET) throw new Error('Missing WO_QR_SECRET');
+
+// 🔧 Optional: map Pipedrive service enum -> label
 const SERVICE_MAP = {
   27: 'Water Mitigation',
   28: 'Fire Cleanup',
   29: 'Contents',
   30: 'Biohazard',
   31: 'General Cleaning',
-  32: 'Duct Cleaning'
+  32: 'Duct Cleaning',
 };
 
-// 🔧 Slack App Init
+// 🔧 Slack app init
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
     events: '/slack/events',
     commands: '/slack/commands',
-    actions: '/slack/interact'
+    actions: '/slack/interact',
   },
-  processBeforeResponse: true
+  processBeforeResponse: true,
 });
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  receiver
+  receiver,
 });
 
-// ✅ Respond to @ mentions
+// Ping
 app.event('app_mention', async ({ event, say }) => {
   await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
 });
 
-// ✅ Handle button click
+// ✅ Slack checkbox → complete PD activity
 app.action('complete_task', async ({ body, ack, client }) => {
   await ack();
+  const checkboxValue = body.actions?.[0]?.selected_options?.[0]?.value;
+  const activityId = checkboxValue?.replace('task_', '');
+  if (!activityId) return;
 
-  const checkboxValue = body.actions[0].selected_options[0].value;
-  const activityId = checkboxValue.replace('task_', '');
-
-  // ✅ Mark task complete in Pipedrive
   try {
-    const markComplete = await fetch(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${PIPEDRIVE_API_TOKEN}`, {
+    const pdUrl = `https://api.pipedrive.com/v1/activities/${activityId}?api_token=${PIPEDRIVE_API_TOKEN}`;
+    const resp = await fetch(pdUrl, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ done: true })
+      body: JSON.stringify({ done: true, marked_as_done_time: new Date().toISOString() }),
     });
-    const result = await markComplete.json();
-    console.log(`✅ Pipedrive task ${activityId} marked complete`, result);
-  } catch (err) {
-    console.error(`❌ Failed to complete task ${activityId} in PD`, err);
+    const j = await resp.json();
+    console.log('PD complete result:', j);
+  } catch (e) {
+    console.error('PD complete error:', e);
   }
 
-  // ✅ Delete original message
   try {
-    await client.chat.delete({
-      channel: body.channel.id,
-      ts: body.message.ts
-    });
-    console.log('✅ Message deleted from Slack');
-  } catch (err) {
-    console.error('❌ Failed to delete message:', err);
+    await client.chat.delete({ channel: body.channel.id, ts: body.message.ts });
+  } catch (e) {
+    console.error('Slack delete error:', e);
   }
 });
 
-// 📜 Handle Webhook Event from Pipedrive
+// 📬 Pipedrive webhook → post task to Slack
 const expressApp = receiver.app;
 expressApp.use(express.json());
 
 expressApp.post('/pipedrive-task', async (req, res) => {
-  console.log('📥 Received request at /pipedrive-task');
-
   try {
     const payload = req.body;
-    console.log('✅ Incoming Pipedrive Payload:', JSON.stringify(payload, null, 2));
+    const activity = payload?.data;
+    if (!activity) return res.status(200).send('No activity.');
 
-    const activity = payload.data;
-    if (!activity) {
-      console.log('⚠️ No activity object found.');
-      return res.status(200).send('No activity object.');
-    }
+    // Optional: restrict during testing
+    // if (activity.owner_id !== 23457092) return res.status(200).send('Not target owner.');
 
-    if (activity.owner_id !== 23457092) {
-      console.log(`🔁 Task assigned to someone else: ${activity.owner_id}`);
-      return res.status(200).send('Not for Mike.');
-    }
-
-    // Fetch full activity details including the note body
-    const activityDetailsRes = await fetch(`https://api.pipedrive.com/v1/activities/${activity.id}?api_token=${PIPEDRIVE_API_TOKEN}`);
-    const activityDetails = await activityDetailsRes.json();
+    // Get full activity info
+    const aRes = await fetch(
+      `https://api.pipedrive.com/v1/activities/${activity.id}?api_token=${PIPEDRIVE_API_TOKEN}`
+    );
+    const aJson = await aRes.json();
 
     let fullNote = '_No note provided_';
     let dealId = 'N/A';
@@ -108,34 +103,35 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     let typeOfService = 'N/A';
     let location = 'N/A';
 
-    if (activityDetails.success && activityDetails.data) {
-      const data = activityDetails.data;
+    if (aJson?.success && aJson.data) {
+      const data = aJson.data;
       fullNote = (data.note || fullNote).replace(/<br\/?>(\s)?/g, '\n').replace(/&nbsp;/g, ' ').trim();
       dealId = data.deal_id || 'N/A';
 
-      // Fetch deal info
       if (dealId && dealId !== 'N/A') {
-        const dealRes = await fetch(`https://api.pipedrive.com/v1/deals/${dealId}?api_token=${PIPEDRIVE_API_TOKEN}`);
-        const dealInfo = await dealRes.json();
-        if (dealInfo.success && dealInfo.data) {
-          dealTitle = dealInfo.data.title || 'N/A';
-          const serviceId = dealInfo.data['5b436b45b63857305f9691910b6567351b5517bc'];
+        const dRes = await fetch(
+          `https://api.pipedrive.com/v1/deals/${dealId}?api_token=${PIPEDRIVE_API_TOKEN}`
+        );
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) {
+          dealTitle = dJson.data.title || 'N/A';
+          const serviceId = dJson.data['5b436b45b63857305f9691910b6567351b5517bc'];
           typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-          location = dealInfo.data.location || 'N/A';
+          location = dJson.data.location || 'N/A';
         }
       }
     }
 
     const message = {
       channel: SCHEDULE_CHANNEL,
-      text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
+      text: `📌 *New Task*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}\n✅ _Click the checkbox below to complete_`,
       blocks: [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `📌 *New Task Created for Mike*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}`
-          }
+            text: `📌 *New Task*\n• *${activity.subject}*\n🗕️ Due: ${activity.due_date || 'No due date'}\n📜 Note: ${fullNote}\n🏷️ Deal ID: ${dealId} - *${dealTitle}*\n📦 Type of Service: ${typeOfService}\n📍 Location: ${location}`,
+          },
         },
         {
           type: 'actions',
@@ -145,32 +141,97 @@ expressApp.post('/pipedrive-task', async (req, res) => {
               action_id: 'complete_task',
               options: [
                 {
-                  text: {
-                    type: 'mrkdwn',
-                    text: 'Mark as complete'
-                  },
-                  value: `task_${activity.id}`
-                }
-              ]
-            }
-          ]
-        }
-      ]
+                  text: { type: 'mrkdwn', text: 'Mark as complete' },
+                  value: `task_${activity.id}`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
     };
 
-    console.log('📤 Sending message to Slack...');
     await app.client.chat.postMessage(message);
-
-    console.log('✅ Message posted to Slack');
-    res.status(200).send('Task processed.');
+    res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ Error processing webhook:', error);
+    console.error('Webhook error:', error);
     res.status(500).send('Server error.');
   }
 });
 
-// 🚀 Start unified Bolt + Express Server
+// --- HMAC helpers (base64url)
+const b64url = (buf) =>
+  Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
+
+const sign = (raw) => b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
+
+function verify(raw, sig) {
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sign(raw)), Buffer.from(String(sig)));
+  } catch {
+    return false;
+  }
+}
+
+// ✅ QR scan → complete task in PD (+ optional Slack ping)
+expressApp.get('/wo/complete', async (req, res) => {
+  try {
+    const { aid, did, cid, exp, sig } = req.query || {};
+    if (!aid || !exp || !sig) return res.status(400).send('Missing params.');
+
+    const now = Math.floor(Date.now() / 1000);
+    if (Number(exp) < now) return res.status(410).send('Link expired.');
+
+    const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
+    if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
+
+    // Mark done in PD
+    const pdUrl = `https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`;
+    const pdPayload = { done: true, marked_as_done_time: new Date().toISOString() };
+    const pdResp = await fetch(pdUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pdPayload),
+    });
+    const pdJson = await pdResp.json();
+    const ok = pdJson && pdJson.success;
+
+    // Slack confirmation
+    const channel = cid || SCHEDULE_CHANNEL;
+    if (channel) {
+      const text = ok
+        ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}.`
+        : `⚠️ Tried to complete task *${aid}* but Pipedrive didn’t confirm success.`;
+      await app.client.chat.postMessage({ channel, text });
+    }
+
+    return res
+      .status(200)
+      .send(`<html><body style="font-family:Arial;padding:24px">
+        <h2>Work Order Complete</h2>
+        <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
+        ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
+        <p>${ok ? 'You’re good to go. ✅' : 'Please contact the office. ⚠️'}</p>
+      </body></html>`);
+  } catch (err) {
+    console.error('/wo/complete error:', err);
+    return res.status(500).send('Server error.');
+  }
+});
+
+// (Optional) helper to generate signed QR URLs server-side
+export function makeSignedQRUrl({ base, aid, did = '', cid = '', ttlSeconds = 7 * 24 * 60 * 60 }) {
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const raw = `${aid}.${did}.${cid}.${exp}`;
+  const sig = sign(raw);
+  const params = new URLSearchParams({ aid, exp: String(exp), sig });
+  if (did) params.set('did', String(did));
+  if (cid) params.set('cid', String(cid));
+  return `${base}?${params.toString()}`;
+}
+
+// 🚀 Start
 (async () => {
   await app.start(PORT);
-  console.log(`✅ Dispatcher (Mike Test) running on port ${PORT}`);
+  console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
