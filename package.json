@@ -2,12 +2,12 @@
   "name": "dispatcher-qr-workorders",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18 <22"
   },
   "dependencies": {
     "@slack/bolt": "^3.19.0",
