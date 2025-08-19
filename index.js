@@ -219,6 +219,7 @@ function detectAssignee({ deal, activity }){
    activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
 */
 const ASSIGNEE_POSTS = new Map();
+const AID_TAG = (id)=>`[AID:${id}]`;
 
 /* ========= PDF builder ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName }) {
@@ -318,27 +319,38 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
 }
 
 /* ========= Delete helpers ========= */
+async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
+  try{
+    const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
+    for (const m of (h?.messages||[])){
+      const text = (m.text||'') + ' ' + (m.previous_message?.text||'');
+      if (text.includes(AID_TAG(activityId))){
+        const files = m.files || [];
+        for (const f of files){
+          try{ await app.client.files.delete({ file: f.id }); } catch(e){ console.warn('[WO] files.delete (marker) failed', f.id, e?.data||e?.message||e); }
+        }
+        try{ await app.client.chat.delete({ channel: channelId, ts: m.ts }); } catch(e){ /* ignore */ }
+      }
+    }
+  }catch(e){ console.warn('[WO] deleteAssigneePdfByMarker failed', channelId, e?.data||e?.message||e); }
+}
+
 async function deleteAssigneePost(activityId){
   const key = String(activityId);
   const rec = ASSIGNEE_POSTS.get(key);
-  if (!rec) return;
-  const { assigneeChannelId, messageTs, fileIds } = rec;
-
-  if (assigneeChannelId && messageTs){
-    try { await app.client.chat.delete({ channel: assigneeChannelId, ts: messageTs }); }
-    catch (e){ console.warn('[WO] chat.delete failed (assignee):', e?.data || e?.message || e); }
-  }
-  if (Array.isArray(fileIds)){
-    for (const fid of fileIds){
-      if (!fid) continue;
-      try { await app.client.files.delete({ file: fid }); }
-      catch (e){ console.warn('[WO] files.delete failed:', fid, e?.data || e?.message || e); }
+  if (rec){
+    const { assigneeChannelId, messageTs, fileIds } = rec;
+    if (assigneeChannelId && messageTs){
+      try { await app.client.chat.delete({ channel: assigneeChannelId, ts: messageTs }); } catch (e){ /* ignore */ }
+      await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400);
     }
+    if (Array.isArray(fileIds)){
+      for (const fid of fileIds){ if (!fid) continue; try { await app.client.files.delete({ file: fid }); } catch(e){} }
+    }
+    ASSIGNEE_POSTS.delete(key);
   }
-  ASSIGNEE_POSTS.delete(key);
 }
 
-// When memory was lost (restart), scan a channel’s recent messages to find our activity post.
 async function findAndDeleteActivityMessageInChannel(activityId, channelId, lookback=200){
   try{
     const hist = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
@@ -353,12 +365,12 @@ async function findAndDeleteActivityMessageInChannel(activityId, channelId, look
           el.options.some(opt => opt?.value === `task_${activityId}`)));
       if (hasOurCheckbox){
         try { await app.client.chat.delete({ channel: channelId, ts: m.ts }); } catch(e){}
-        return true;
       }
     }
   }catch(e){
     console.warn('[WO] findAndDeleteActivityMessageInChannel failed', channelId, e?.data || e?.message || e);
   }
+  await deleteAssigneePdfByMarker(activityId, channelId, 400);
   return false;
 }
 
@@ -388,94 +400,55 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
   const scheduledText = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ') || 'No due date';
   const blocks = buildSlackBlocks({ activity, noteText, dealId, dealTitle, typeOfService, location, assigneeName });
+  const ic = `📄 Work Order PDF (scan QR to complete) ${AID_TAG(activity.id)}`;
 
-  // Job channel (persistent)
   if (jobChannelId){
     await ensureBotInChannel(jobChannelId);
-    await app.client.chat.postMessage({
-      channel: jobChannelId,
-      text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`,
-      blocks
-    });
+    await app.client.chat.postMessage({ channel: jobChannelId, text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`, blocks });
     if (ENABLE_SLACK_PDF_UPLOAD){
-      try {
-        await uploadPdfToSlack({
-          channel: jobChannelId,
-          filename,
-          pdfBuffer,
-          title:`Work Order — ${activity.subject || ''}`,
-          initialComment:'📄 Work Order PDF (scan QR to complete)'
-        });
-      } catch(e){ console.warn('[WO] files.uploadV2 (job) failed:', e?.data || e?.message || e); }
+      try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: ic }); }
+      catch(e){ console.warn('[WO] files.uploadV2 (job) failed:', e?.data || e?.message || e); }
     }
   }
 
-  // Assignee channel (delete-on-reassign + file tracking)
   if (assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
 
-    if (ENABLE_DELETE_ON_REASSIGN) {
-      await deleteAssigneePost(activity.id);
-    }
+    if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
 
-    const aMsg = await app.client.chat.postMessage({
-      channel: assigneeChannelId,
-      text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`,
-      blocks
-    });
+    const aMsg = await app.client.chat.postMessage({ channel: assigneeChannelId, text: `📌 New Task • ${activity.subject || '-'} • Due: ${scheduledText}`, blocks });
 
     const record = { assigneeChannelId, messageTs: aMsg.ts, fileIds: [] };
 
     if (ENABLE_SLACK_PDF_UPLOAD){
       try {
-        const up = await uploadPdfToSlack({
-          channel: assigneeChannelId,
-          filename,
-          pdfBuffer,
-          title:`Work Order — ${activity.subject || ''}`,
-          initialComment:'📄 Work Order PDF (scan QR to complete)'
-        });
+        const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: ic });
         const fids = [];
-        if (up?.files && Array.isArray(up.files)) {
-          for (const f of up.files) if (f?.id) fids.push(f.id);
-        } else if (up?.file?.id) {
-          fids.push(up.file.id);
-        }
+        if (up?.files && Array.isArray(up.files)) { for (const f of up.files) if (f?.id) fids.push(f.id); }
+        else if (up?.file?.id) { fids.push(up.file.id); }
         record.fileIds = fids;
-      } catch(e){
-        console.warn('[WO] files.uploadV2 (assignee) failed:', e?.data || e?.message || e);
-      }
+      } catch(e){ console.warn('[WO] files.uploadV2 (assignee) failed:', e?.data || e?.message || e); }
     }
 
     ASSIGNEE_POSTS.set(String(activity.id), record);
   }
 
-  // PD side
-  if (ENABLE_PD_FILE_UPLOAD){
-    try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); }
-    catch(e){ console.error('[WO] PD upload failed:', e); }
-  }
+  if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
   if (ENABLE_PD_NOTE){
     const completeUrl = makeSignedCompleteUrl({ aid:String(activity.id), did:String(dealId), cid: jobChannelId || DEFAULT_CHANNEL });
-    await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ deal_id: dealId, content: `Work Order posted to Slack.\nScan to complete: ${completeUrl}` })
-    });
+    await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ deal_id: dealId, content: `Work Order posted to Slack.\nScan to complete: ${completeUrl}` }) });
   }
 }
 
 /* ========= Webhook (activities + deal updates + deletes) ========= */
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
-    if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
-      return res.status(403).send('Forbidden');
-    }
+    if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) { return res.status(403).send('Forbidden'); }
 
     const meta = req.body?.meta || {};
     const rawEntity  = (meta.entity || '').toString().toLowerCase();
     const rawAction  = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
 
-    // Normalize action
     const action = /^(create|add|added)$/.test(rawAction) ? 'create'
                   : /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
                   : /^(delete|deleted)$/.test(rawAction) ? 'delete'
@@ -487,29 +460,16 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
-    // === ACTIVITY create/update ===
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
       if (!data?.id) return res.status(200).send('No activity');
+      if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
 
-      // Skip completed to avoid resurrecting old work
-      if (data.done === true || data.done === 1) {
-        console.log('[PD Hook] skip activity id=%s (already done)', data.id);
-        return res.status(200).send('OK');
-      }
-
-      // Fetch full, current activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
+      if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
-      // Double-check completion
-      if (activity.done === true || activity.done === 1) {
-        console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id);
-        return res.status(200).send('OK');
-      }
-
-      // Pull deal for routing + PDF text
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -517,7 +477,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
 
-      // If UPDATE, detect old assignee and remove their post
       if (action === 'update') {
         const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
         const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
@@ -525,82 +484,57 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
         const newAss = detectAssignee({ deal, activity });
         const oldChannel = (()=>{
- if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
- if (prevCrewName) {
-   const key = prevCrewName.toLowerCase();
-   return NAME_TO_CHANNEL[key] || null;
- }
- return null;
-})();
+          if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
+          if (prevCrewName) { const key = prevCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
+          return null;
+        })();
 
         const changed =
           (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
           (prevCrewName && prevCrewName.toLowerCase() !== (newAss.teamName||'').toLowerCase());
 
         if (changed && ENABLE_DELETE_ON_REASSIGN) {
-          if (oldChannel) {
-            console.log('[WO] activity.update → deleting old post in channel %s', oldChannel);
-            await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400);
-          }
+          if (oldChannel) { console.log('[WO] activity.update → deleting old post in channel %s', oldChannel); await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400); }
           await deleteAssigneePost(activity.id);
         }
       }
 
-      // Resolve target channels
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
-      console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s',
-        action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
+      console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
 
-      await postWorkOrderToChannels({
-        activity, deal, jobChannelId,
-        assigneeChannelId: assignee.channelId,
-        assigneeName: assignee.teamName,
-        noteText: activity.note
-      });
-
+      await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
       return res.status(200).send('OK');
     }
 
-    // === DEAL update (reassignment via field/title) ===
     if (entity === 'deal' && action === 'update') {
       const deal = data;
       if (!deal?.id) return res.status(200).send('No deal');
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-
       const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
       const oldCrewName = crewNameFrom(prev?.title);
       const newCrewName = crewNameFrom(deal?.title);
 
       const teamChanged = oldTeamId !== newTeamId;
       const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
-
-      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s',
-        teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
-
+      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
       if (!teamChanged && !crewChanged) return res.status(200).send('OK');
 
       const assignee = detectAssignee({ deal, activity: null });
-      if (!assignee.channelId) {
-        console.log('[PD Hook] no assignee channel resolved for deal update');
-        return res.status(200).send('OK');
-      }
+      if (!assignee.channelId) { console.log('[PD Hook] no assignee channel resolved for deal update'); return res.status(200).send('OK'); }
 
       let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      // Fetch OPEN (not done) activities for this deal, and re-post each to new assignee
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
-
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
-      // try to delete old post from old assignee channel (if we can infer it)
       const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName });
 
       for (const activity of items) {
@@ -609,22 +543,13 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldChannel) await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 200);
             await deleteAssigneePost(activity.id);
           }
-
-          await postWorkOrderToChannels({
-            activity, deal, jobChannelId,
-            assigneeChannelId: assignee.channelId,
-            assigneeName: assignee.teamName,
-            noteText: activity.note
-          });
-        } catch (e) {
-          console.error('[WO] re-route failed', activity?.id, e?.message||e);
-        }
+          await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
+        } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
 
       return res.status(200).send('OK');
     }
 
-    // === ACTIVITY delete (optional cleanup) ===
     if (entity === 'activity' && (action === 'delete')) {
       const id = data?.id || meta?.entity_id;
       console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
@@ -704,10 +629,7 @@ expressApp.get('/debug/upload-test', async (req,res)=>{
     doc.moveDown().fontSize(12).text(`Channel: ${channel}`);
     doc.end();
     const pdfBuffer = await finished;
-    const result = await app.client.files.uploadV2({
-      channel_id: channel, file: pdfBuffer, filename:'dispatcher-test.pdf',
-      title:'Dispatcher Test PDF', initial_comment:'Test upload from /debug/upload-test'
-    });
+    const result = await app.client.files.uploadV2({ channel_id: channel, file: pdfBuffer, filename:'dispatcher-test.pdf', title:'Dispatcher Test PDF', initial_comment:`Test upload ${AID_TAG('debug')}` });
     console.log('DEBUG uploadV2 result:', result.ok);
     res.status(200).send('Uploaded test PDF to Slack with files.uploadV2.');
   }catch(e){
@@ -743,10 +665,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     }
 
     const channelIdForQr = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
-    const pdfBuffer = await buildWorkOrderPdfBuffer({
-      activity: data, dealTitle, typeOfService, location,
-      channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName
-    });
+    const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
     return res.send(pdfBuffer);
@@ -757,7 +676,4 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 });
 
 /* ========= Start ========= */
-(async () => {
-  await app.start(PORT);
-  console.log(`✅ Dispatcher running on port ${PORT}`);
-})();
+(async () => { await app.start(PORT); console.log(`✅ Dispatcher running on port ${PORT}`); })();
