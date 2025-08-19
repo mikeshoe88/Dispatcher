@@ -18,14 +18,14 @@ const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const SIGNING_SECRET = process.env.WO_QR_SECRET;
 const DEFAULT_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 const BASE_URL = process.env.BASE_URL;
-const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // use ?key=... in PD webhook
+const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY;            // append ?key=... in PD webhook
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null;
 
 // Feature toggles
-const ENABLE_PD_FILE_UPLOAD   = process.env.ENABLE_PD_FILE_UPLOAD   !== 'false';
-const ENABLE_PD_NOTE          = process.env.ENABLE_PD_NOTE          !== 'false';
-const ENABLE_SLACK_PDF_UPLOAD = process.env.ENABLE_SLACK_PDF_UPLOAD !== 'false';
+const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
+const ENABLE_PD_NOTE            = process.env.ENABLE_PD_NOTE            !== 'false';
+const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
@@ -374,8 +374,9 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   if (assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
 
-    // If reposting for the same activity, clear previous assignee post/files first.
-    await deleteAssigneePost(activity.id);
+    if (ENABLE_DELETE_ON_REASSIGN) {
+      await deleteAssigneePost(activity.id);
+    }
 
     const aMsg = await app.client.chat.postMessage({
       channel: assigneeChannelId,
@@ -426,25 +427,42 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
 /* ========= Webhook (activities + deal updates + deletes) ========= */
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
-    if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) return res.status(403).send('Forbidden');
+    if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
+      return res.status(403).send('Forbidden');
+    }
 
     const meta = req.body?.meta || {};
-    const entity = meta.entity;   // 'activity' | 'deal'
-    const action = meta.action;   // 'create' | 'update' | 'delete' | ...
+    const rawEntity  = (meta.entity || '').toString().toLowerCase();
+    const rawAction  = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
+
+    // Normalize action → create | update | delete
+    const action = /^(create|add|added)$/.test(rawAction) ? 'create'
+                  : /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
+                  : /^(delete|deleted)$/.test(rawAction) ? 'delete'
+                  : rawAction || 'unknown';
+
+    const entity = rawEntity || 'unknown';
     const data   = req.body?.data || req.body?.current || null;
     const prev   = req.body?.previous || null;
 
+    console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
+
     // === ACTIVITY create/update ===
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
-      if (!data?.id) return res.status(200).send('No activity');
+      if (!data?.id) {
+        console.log('[PD Hook] no activity id in payload');
+        return res.status(200).send('No activity');
+      }
 
-      // fetch full activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
-      if (!aJson?.success || !aJson.data) throw new Error('Activity fetch failed');
+      if (!aJson?.success || !aJson.data) {
+        console.error('[PD Hook] Activity fetch failed', aJson);
+        return res.status(200).send('Activity fetch fail');
+      }
       const activity = aJson.data;
 
-      // fetch deal (for routing + pdf text)
+      // fetch deal for routing + pdf text
       let deal = null;
       if (activity.deal_id){
         const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -452,12 +470,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
 
-      // Channel where QR confirms
+      // Where the QR confirms
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
       // Detect assignee (deal field or Crew: Name)
       const assignee = detectAssignee({ deal, activity });
+
+      console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s',
+        action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
@@ -469,13 +490,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // === DEAL update (reassignment) ===
+    // === DEAL update (reassignment via field/title) ===
     if (entity === 'deal' && action === 'update') {
       const deal = data;
-      if (!deal?.id) return res.status(200).send('No deal');
+      if (!deal?.id) {
+        console.log('[PD Hook] deal update without id');
+        return res.status(200).send('No deal');
+      }
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
+
       const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
       const oldCrewName = crewNameFrom(prev?.title);
       const newCrewName = crewNameFrom(deal?.title);
@@ -483,18 +508,26 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const teamChanged = oldTeamId !== newTeamId;
       const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
 
+      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s',
+        teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
+
       if (!teamChanged && !crewChanged) return res.status(200).send('OK');
 
       const assignee = detectAssignee({ deal, activity: null });
-      if (!assignee.channelId) return res.status(200).send('OK');
+      if (!assignee.channelId) {
+        console.log('[PD Hook] no assignee channel resolved for deal update');
+        return res.status(200).send('OK');
+      }
 
       let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      // Fetch open activities for this deal
+      // Fetch OPEN activities for this deal, and re-post each to new assignee
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
       const items = listJson?.data || [];
+
+      console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
       for (const activity of items) {
         try {
@@ -504,19 +537,23 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             assigneeName: assignee.teamName,
             noteText: activity.note
           });
-        } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
+        } catch (e) {
+          console.error('[WO] re-route failed', activity?.id, e?.message||e);
+        }
       }
 
       return res.status(200).send('OK');
     }
 
-    // === ACTIVITY delete (optional) → clean up assignee post if we know it ===
-    if (entity === 'activity' && action === 'delete') {
+    // === ACTIVITY delete (optional cleanup) ===
+    if (entity === 'activity' && (action === 'delete')) {
       const id = data?.id || meta?.entity_id;
+      console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
       if (id) await deleteAssigneePost(id);
       return res.status(200).send('OK');
     }
 
+    console.log('[PD Hook] ignored event entity=%s action=%s', entity, action);
     return res.status(200).send('OK');
   } catch (error) {
     console.error('[PD Hook] ERROR:', error?.stack || error?.data || error?.message || error);
@@ -608,7 +645,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) return res.status(400).send('Missing aid');
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) return res.status(404).send('Activity not found');
     const data = aj.data;
