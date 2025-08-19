@@ -41,7 +41,7 @@ process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:'
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
-const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Pena',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Kim' };
+const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Pena',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Slot 1',57:'Slot 2',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
@@ -50,11 +50,12 @@ const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 const PRODUCTION_TEAM_TO_CHANNEL = {
   52: 'C09BA0XUAV7',   // Anastacio
   53: 'C098H8GU355',   // Mike
+  55: 'C09BFFGBYTB',   // Greg
 };
 
 // Fallback name→channel for parsing "Crew: Name"
-const NAME_TO_CHANNEL = { anastacio:'C09BA0XUAV7', mike:'C098H8GU355' };
-const NAME_TO_TEAM_ID = { anastacio:52, mike:53 };
+const NAME_TO_CHANNEL = { anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB' };
+const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55 };
 
 /* ========= Slack App ========= */
 const receiver = new ExpressReceiver({
