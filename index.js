@@ -18,7 +18,7 @@ const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const SIGNING_SECRET = process.env.WO_QR_SECRET;
 const DEFAULT_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 const BASE_URL = process.env.BASE_URL;
-const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY;            // append ?key=... in PD webhook
+const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY;
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null;
 
@@ -331,6 +331,39 @@ async function deleteAssigneePost(activityId){
   ASSIGNEE_POSTS.delete(key);
 }
 
+// When memory was lost (restart), scan a channel’s recent messages to find our activity post.
+async function findAndDeleteActivityMessageInChannel(activityId, channelId, lookback=200){
+  try{
+    const hist = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
+    const msgs = hist?.messages || [];
+    for (const m of msgs){
+      const blocks = m.blocks || [];
+      const hasOurCheckbox = blocks.some(b =>
+        b?.type === 'actions' &&
+        Array.isArray(b.elements) &&
+        b.elements.some(el => el?.type === 'checkboxes' &&
+          Array.isArray(el.options) &&
+          el.options.some(opt => opt?.value === `task_${activityId}`)));
+      if (hasOurCheckbox){
+        try { await app.client.chat.delete({ channel: channelId, ts: m.ts }); } catch(e){}
+        return true;
+      }
+    }
+  }catch(e){
+    console.warn('[WO] findAndDeleteActivityMessageInChannel failed', channelId, e?.data || e?.message || e);
+  }
+  return false;
+}
+
+function channelFromOldAssignment({ oldTeamId, oldCrewName }){
+  if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId];
+  if (oldCrewName){
+    const key = String(oldCrewName).toLowerCase();
+    if (NAME_TO_CHANNEL[key]) return NAME_TO_CHANNEL[key];
+  }
+  return null;
+}
+
 /* ========= Core post ========= */
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
@@ -449,18 +482,23 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     // === ACTIVITY create/update ===
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
-      if (!data?.id) {
-        console.log('[PD Hook] no activity id in payload');
-        return res.status(200).send('No activity');
+      if (!data?.id) return res.status(200).send('No activity');
+
+      // Skip completed activities (prevents re-queue when Production Team changes historically)
+      if (data.done === true || data.done === 1) {
+        console.log('[PD Hook] skip activity id=%s (already done)', data.id);
+        return res.status(200).send('OK');
       }
 
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
-      if (!aJson?.success || !aJson.data) {
-        console.error('[PD Hook] Activity fetch failed', aJson);
-        return res.status(200).send('Activity fetch fail');
-      }
+      if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
+
+      if (activity.done === true || activity.done === 1) {
+        console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id);
+        return res.status(200).send('OK');
+      }
 
       // fetch deal for routing + pdf text
       let deal = null;
@@ -470,11 +508,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
 
-      // Where the QR confirms
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      // Detect assignee (deal field or Crew: Name)
       const assignee = detectAssignee({ deal, activity });
 
       console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s',
@@ -493,10 +529,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     // === DEAL update (reassignment via field/title) ===
     if (entity === 'deal' && action === 'update') {
       const deal = data;
-      if (!deal?.id) {
-        console.log('[PD Hook] deal update without id');
-        return res.status(200).send('No deal');
-      }
+      if (!deal?.id) return res.status(200).send('No deal');
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
@@ -522,15 +555,23 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      // Fetch OPEN activities for this deal, and re-post each to new assignee
+      // Fetch OPEN (not done) activities for this deal, and re-post each to new assignee
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = listJson?.data || [];
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
 
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
+      // try to delete old post from old assignee channel (if we can infer it)
+      const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName });
+
       for (const activity of items) {
         try {
+          if (ENABLE_DELETE_ON_REASSIGN) {
+            if (oldChannel) await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 200);
+            await deleteAssigneePost(activity.id);
+          }
+
           await postWorkOrderToChannels({
             activity, deal, jobChannelId,
             assigneeChannelId: assignee.channelId,
@@ -571,7 +612,6 @@ expressApp.get('/wo/complete', async (req, res) => {
     const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
-    // Mark complete in PD
     const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: new Date().toISOString() })
@@ -579,10 +619,8 @@ expressApp.get('/wo/complete', async (req, res) => {
     const pdJson = await pdResp.json();
     const ok = pdJson && pdJson.success;
 
-    // Cleanup assignee’s post/PDF (moving schedule UX)
     await deleteAssigneePost(aid);
 
-    // Confirm in job channel (cid)
     const jobChannel = cid || DEFAULT_CHANNEL;
     if (jobChannel) {
       const text = ok ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}.`
