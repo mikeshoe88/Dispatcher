@@ -18,9 +18,9 @@ const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const SIGNING_SECRET = process.env.WO_QR_SECRET;
 const DEFAULT_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 const BASE_URL = process.env.BASE_URL;
-const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY;
+const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
-const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null;
+const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // debugging override
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
@@ -43,7 +43,7 @@ process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:'
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
 const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Pena',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Kim' };
 
-// PD custom field key (Production Team on DEAL)
+// PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
 // Production Team enum ID → Slack channel
@@ -105,7 +105,7 @@ const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
 // Minimal HTML→text for PD notes
 function htmlToPlainText(input=''){
   let s = String(input);
-  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<br\s*\/?>(\s)?/gi, '\n');
   s = s.replace(/<\/?p[^>]*>/gi, '\n');
   s = s.replace(/<\/li>\s*<li[^>]*>/gi, '\n• ');
   s = s.replace(/<li[^>]*>/gi, '• ');
@@ -177,7 +177,7 @@ async function findDealChannelId(dealId){
 async function ensureBotInChannel(channelId){
   if (!channelId) return;
   try{ await app.client.conversations.join({ channel: channelId }); }
-  catch{ /* ignore already_in_channel etc. */ }
+  catch{ /* already_in_channel etc. */ }
 }
 
 async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }){
@@ -186,16 +186,23 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-/* ========= Assignee detection ========= */
+/* ========= Assignee detection (Deal OR Activity OR Crew:) ========= */
 function detectAssignee({ deal, activity }){
-  // Prefer Deal field
-  if (deal){
-    const tid = deal[PRODUCTION_TEAM_FIELD_KEY];
-    if (tid && PRODUCTION_TEAM_TO_CHANNEL[tid]) {
-      return { teamId: tid, teamName: PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[tid] };
+  // 1) Activity-level Production Team
+  if (activity) {
+    const aTid = activity[PRODUCTION_TEAM_FIELD_KEY];
+    if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) {
+      return { teamId: aTid, teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
     }
   }
-  // Fallback parse "Crew: Name"
+  // 2) Deal-level Production Team
+  if (deal) {
+    const dTid = deal[PRODUCTION_TEAM_FIELD_KEY];
+    if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) {
+      return { teamId: dTid, teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
+    }
+  }
+  // 3) Fallback parse from title/subject
   const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
   if (name){
@@ -468,7 +475,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const rawEntity  = (meta.entity || '').toString().toLowerCase();
     const rawAction  = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
 
-    // Normalize action → create | update | delete
+    // Normalize action
     const action = /^(create|add|added)$/.test(rawAction) ? 'create'
                   : /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
                   : /^(delete|deleted)$/.test(rawAction) ? 'delete'
@@ -484,33 +491,64 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
       if (!data?.id) return res.status(200).send('No activity');
 
-      // Skip completed activities (prevents re-queue when Production Team changes historically)
+      // Skip completed to avoid resurrecting old work
       if (data.done === true || data.done === 1) {
         console.log('[PD Hook] skip activity id=%s (already done)', data.id);
         return res.status(200).send('OK');
       }
 
+      // Fetch full, current activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
 
+      // Double-check completion
       if (activity.done === true || activity.done === 1) {
         console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id);
         return res.status(200).send('OK');
       }
 
-      // fetch deal for routing + pdf text
+      // Pull deal for routing + PDF text
       let deal = null;
-      if (activity.deal_id){
+      if (activity.deal_id) {
         const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
 
+      // If UPDATE, detect old assignee and remove their post
+      if (action === 'update') {
+        const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
+        const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
+        const prevCrewName = prevCrew(prev?.subject);
+
+        const newAss = detectAssignee({ deal, activity });
+        const oldChannel = (()=>{
+ if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
+ if (prevCrewName) {
+   const key = prevCrewName.toLowerCase();
+   return NAME_TO_CHANNEL[key] || null;
+ }
+ return null;
+})();
+
+        const changed =
+          (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
+          (prevCrewName && prevCrewName.toLowerCase() !== (newAss.teamName||'').toLowerCase());
+
+        if (changed && ENABLE_DELETE_ON_REASSIGN) {
+          if (oldChannel) {
+            console.log('[WO] activity.update → deleting old post in channel %s', oldChannel);
+            await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400);
+          }
+          await deleteAssigneePost(activity.id);
+        }
+      }
+
+      // Resolve target channels
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
-
       const assignee = detectAssignee({ deal, activity });
 
       console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s',
@@ -719,4 +757,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 });
 
 /* ========= Start ========= */
-receiver.app.listen(PORT, () => console.log(`✅ Dispatcher running on port ${PORT}`));
+(async () => {
+  await app.start(PORT);
+  console.log(`✅ Dispatcher running on port ${PORT}`);
+})();
