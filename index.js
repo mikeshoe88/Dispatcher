@@ -45,7 +45,7 @@ const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector'
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
 // Use env first; fall back to old default only if provided (recommended: set env correctly)
-const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY || '8bbab3c120ade3217b8738f001033064e803cdef';
+const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
