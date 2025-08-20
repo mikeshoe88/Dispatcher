@@ -216,7 +216,7 @@ function detectAssignee({ deal, activity }){
     }
   }
   // 3) Fallback parse from title/subject
-  const crewFrom = (s) => (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
+  const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
   if (name){
     const key = name.toLowerCase();
@@ -521,7 +521,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (action === 'update') {
         const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-        const prevCrew = (s)=> (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
+        const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
         const prevCrewName = prevCrew(prev?.subject);
 
         const newAss = detectAssignee({ deal, activity });
@@ -557,7 +557,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-      const crewNameFrom = (s)=> (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
+      const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
       const oldCrewName = crewNameFrom(prev?.title);
       const newCrewName = crewNameFrom(deal?.title);
 
