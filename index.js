@@ -69,21 +69,8 @@ app.event('app_mention', async ({ event, say }) => {
   await say(`Hey <@${event.user}>, Dispatcher is online and running!`);
 });
 
-app.action('complete_task', async ({ body, ack, client }) => {
-  await ack();
-  const val = body.actions?.[0]?.selected_options?.[0]?.value;
-  const activityId = val?.replace('task_', '');
-  if (!activityId) return;
-  try {
-    await fetch(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${PIPEDRIVE_API_TOKEN}`, {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ done:true, marked_as_done_time: new Date().toISOString() })
-    });
-  } catch (e) { console.error('PD complete error:', e); }
-  try {
-    await client.chat.delete({ channel: body.channel.id, ts: body.message.ts });
-  } catch(e){ console.error('Slack delete error:', e); }
-});
+// ⚠️ QR-ONLY COMPLETION: removed crew completion checkbox handler
+// (Old app.action('complete_task') deleted to enforce QR-only path.)
 
 /* ========= Express ========= */
 const expressApp = receiver.app;
@@ -222,7 +209,7 @@ function detectAssignee({ deal, activity }){
 const ASSIGNEE_POSTS = new Map();
 const AID_TAG = (id)=>`[AID:${id}]`;
 
-/* ========= PDF builder ========= */
+/* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName }) {
   const completeUrl = makeSignedCompleteUrl({
     aid: String(activity.id),
@@ -262,7 +249,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   }
 
   doc.font('Helvetica-Bold').text('Scan to Complete');
-  doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive and posts a confirmation in Slack.');
+  doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive.');
   doc.moveDown(0.5);
   doc.image(qrBuffer, { fit:[120,120] });
   doc.moveDown(0.25);
@@ -272,14 +259,41 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   return done;
 }
 
+function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt }) {
+  const doc = new PDFDocument({ margin: 50 });
+  const chunks = [];
+  doc.on('data', c => chunks.push(c));
+  // return a Buffer at end
+  const finish = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
+
+  doc.fontSize(20).text('Work Order Completed', { align: 'center' });
+  doc.moveDown();
+  doc.fontSize(12)
+     .text(`Task: ${activity?.subject || '-'}`)
+     .text(`Activity ID: ${activity?.id || '-'}`)
+     .text(`Deal: ${dealTitle || '-'}`)
+     .text(`Type of Service: ${typeOfService || '-'}`)
+     .text(`Location: ${location || '-'}`)
+     .text(`Completed At: ${new Date(completedAt || Date.now()).toLocaleString()}`);
+
+  const rawNote = htmlToPlainText(activity?.note || '');
+  if (rawNote) {
+    doc.moveDown();
+    doc.font('Helvetica-Bold').text('Final Notes');
+    doc.font('Helvetica').text(rawNote, { width: 520 });
+  }
+
+  doc.end();
+  return finish;
+}
+
 /* ========= Slack helpers ========= */
 function buildSlackBlocks({ activity, noteText, dealId, dealTitle, typeOfService, location, assigneeName }){
   const scheduledText = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ') || 'No due date';
   const pdfUrl = buildPdfUrl(activity.id);
-  const actionElements = [{
-    type:'checkboxes', action_id:'complete_task',
-    options:[{ text:{type:'mrkdwn', text:'Mark as complete'}, value:`task_${activity.id}` }]
-  }];
+
+  // ⚠️ QR-ONLY COMPLETION: no checkboxes here; only a "Open PDF" button
+  const actionElements = [];
   if (pdfUrl) actionElements.push({ type:'button', text:{type:'plain_text', text:'Open Work Order PDF'}, url: pdfUrl });
 
   const cleanNote = htmlToPlainText(noteText || activity.note || '_No note provided_');
@@ -292,9 +306,10 @@ function buildSlackBlocks({ activity, noteText, dealId, dealTitle, typeOfService
       `\n🏷️ Deal ID: ${dealId} - *${dealTitle}*` +
       `\n📦 Type of Service: ${typeOfService}` +
       `\n📍 Location: ${location}` +
-      (assigneeName ? `\n👷 Assigned To: ${assigneeName}` : '')
+      (assigneeName ? `\n👷 Assigned To: ${assigneeName}` : '') +
+      `\n\n*Scan the QR on the PDF to complete this task.*`
     }},
-    { type:'actions', elements: actionElements },
+    ...(actionElements.length ? [{ type:'actions', elements: actionElements }] : [])
   ];
 }
 
@@ -434,6 +449,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     ASSIGNEE_POSTS.set(String(activity.id), record);
   }
 
+  // Keep original PD upload of the *work order* PDF if desired
   if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
   if (ENABLE_PD_NOTE){
     const completeUrl = makeSignedCompleteUrl({ aid:String(activity.id), did:String(dealId), cid: jobChannelId || DEFAULT_CHANNEL });
@@ -566,7 +582,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   }
 });
 
-/* ========= QR Complete ========= */
+/* ========= QR Complete (ONLY path to completion) ========= */
 expressApp.get('/wo/complete', async (req, res) => {
   try {
     const { aid, did, cid, exp, sig } = req.query || {};
@@ -576,18 +592,52 @@ expressApp.get('/wo/complete', async (req, res) => {
     const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
+    // 1) Mark PD activity done (idempotent-ish)
     const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: new Date().toISOString() })
     });
     const pdJson = await pdResp.json();
-    const ok = pdJson && pdJson.success;
+    const ok = !!(pdJson && pdJson.success);
 
+    // 2) Fetch activity + deal (for PDF fields)
+    let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
+    try {
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aJson = await aRes.json();
+      if (aJson?.success && aJson.data) {
+        activity = aJson.data;
+        const dealId = did || activity.deal_id;
+        if (dealId) {
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const dJson = await dRes.json();
+          if (dJson?.success && dJson.data) {
+            deal = dJson.data;
+            dealTitle = deal.title || 'N/A';
+            const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
+            typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+            location = deal.location || 'N/A';
+          }
+        }
+      }
+    } catch (e) { console.warn('[WO] fetch for completion PDF failed', e?.message||e); }
+
+    // 3) Generate and upload a *Completed Work Order* PDF to PD
+    try {
+      const completedPdf = await buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt: Date.now() });
+      const up = await uploadPdfToPipedrive({ dealId: did || activity?.deal_id, pdfBuffer: completedPdf, filename: `WO_${aid}_Completed.pdf` });
+      console.log('[WO] completion PDF uploaded', up?.success);
+    } catch (e) {
+      console.error('[WO] completion PDF upload failed', e?.message||e);
+    }
+
+    // 4) Clean up Slack WO message (if we posted one)
     await deleteAssigneePost(aid);
 
+    // 5) Notify channel
     const jobChannel = cid || DEFAULT_CHANNEL;
     if (jobChannel) {
-      const text = ok ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}.`
+      const text = ok ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}. PDF attached to deal.`
                       : `⚠️ Tried to complete task *${aid}* but Pipedrive didn’t confirm success.`;
       await app.client.chat.postMessage({ channel: jobChannel, text });
     }
@@ -596,7 +646,7 @@ expressApp.get('/wo/complete', async (req, res) => {
       `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
        <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
        ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
-       <p>${ok ? 'You’re good to go. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
+       <p>${ok ? 'A completion PDF has been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
     );
   } catch (err) {
     console.error('/wo/complete error:', err);
