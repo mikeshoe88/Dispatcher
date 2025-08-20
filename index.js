@@ -41,21 +41,46 @@ process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:'
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
-const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Pena',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Slot 1',57:'Slot 2',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
+const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
-const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
+// Use env first; fall back to old default only if provided (recommended: set env correctly)
+const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY || '8bbab3c120ade3217b8738f001033064e803cdef';
 
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
+  47: 'C09BXCCD95W',   // Kings
+  48: 'C09ASB1N32B',   // Johnathan
+  49: 'C09ASBE36Q7',   // Penabad
+  50: 'C09B6P5LVPY',   // Hector
+  51: 'C09AZ6VT459',   // Sebastian
   52: 'C09BA0XUAV7',   // Anastacio
   53: 'C098H8GU355',   // Mike
+  54: 'C09AZ63JEJF',   // Gary
   55: 'C09BFFGBYTB',   // Greg
+  56: 'C09B49MJHEE',   // Amber (Slot 1)
+  57: 'C09B85LE544',   // Anna Marie (Slot 2)
+  58: null,            // Slot 3
+  59: null,            // Slot 4
+  60: null             // Slot 5
 };
 
 // Fallback name→channel for parsing "Crew: Name"
-const NAME_TO_CHANNEL = { anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB' };
-const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55 };
+const NAME_TO_CHANNEL = {
+  anastacio:'C09BA0XUAV7',
+  mike:'C098H8GU355',
+  greg:'C09BFFGBYTB',
+  amber:'C09B49MJHEE',
+  'anna marie':'C09B85LE544',
+  annamarie:'C09B85LE544',
+  kings:'C09BXCCD95W',
+  penabad:'C09ASBE36Q7',
+  johnathan:'C09ASB1N32B',
+  gary:'C09AZ63JEJF',
+  hector:'C09B6P5LVPY',
+  sebastian:'C09AZ6VT459'
+};
+const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55, amber:56, 'anna marie':57, annamarie:57, kings:47, penabad:49, johnathan:48, gary:54, hector:50, sebastian:51 };
 
 /* ========= Slack App ========= */
 const receiver = new ExpressReceiver({
@@ -191,7 +216,7 @@ function detectAssignee({ deal, activity }){
     }
   }
   // 3) Fallback parse from title/subject
-  const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
+  const crewFrom = (s) => (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
   if (name){
     const key = name.toLowerCase();
@@ -496,7 +521,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (action === 'update') {
         const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-        const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
+        const prevCrew = (s)=> (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
         const prevCrewName = prevCrew(prev?.subject);
 
         const newAss = detectAssignee({ deal, activity });
@@ -532,7 +557,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-      const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z]+)/i)?.[1] || null) : null);
+      const crewNameFrom = (s)=> (s ? (String(s).match(\/Crew:\s*([A-Za-z][A-Za-z ]*)\/i)?.[1] || null) : null);
       const oldCrewName = crewNameFrom(prev?.title);
       const newCrewName = crewNameFrom(deal?.title);
 
