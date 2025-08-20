@@ -70,9 +70,11 @@ const NAME_TO_CHANNEL = {
   anastacio:'C09BA0XUAV7',
   mike:'C098H8GU355',
   greg:'C09BFFGBYTB',
+  gregory:'C09BFFGBYTB', // alias
   amber:'C09B49MJHEE',
   'anna marie':'C09B85LE544',
   annamarie:'C09B85LE544',
+  'anna-marie':'C09B85LE544', // alias with hyphen
   kings:'C09BXCCD95W',
   penabad:'C09ASBE36Q7',
   johnathan:'C09ASB1N32B',
@@ -80,7 +82,22 @@ const NAME_TO_CHANNEL = {
   hector:'C09B6P5LVPY',
   sebastian:'C09AZ6VT459'
 };
-const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55, amber:56, 'anna marie':57, annamarie:57, kings:47, penabad:49, johnathan:48, gary:54, hector:50, sebastian:51 };
+const NAME_TO_TEAM_ID = {
+  anastacio:52,
+  mike:53,
+  greg:55,
+  gregory:55,
+  amber:56,
+  'anna marie':57,
+  annamarie:57,
+  'anna-marie':57,
+  kings:47,
+  penabad:49,
+  johnathan:48,
+  gary:54,
+  hector:50,
+  sebastian:51
+};
 
 /* ========= Slack App ========= */
 const receiver = new ExpressReceiver({
@@ -114,6 +131,7 @@ function verify(raw,sig){
   }catch{ return false; }
 }
 const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
+const titleize = (s)=> String(s||'').split(' ').map(w=>w? (w[0].toUpperCase()+w.slice(1)) : '').join(' ');
 
 // Minimal HTML→text for PD notes
 function htmlToPlainText(input=''){
@@ -130,6 +148,29 @@ function htmlToPlainText(input=''){
        .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   s = s.replace(/\n{3,}/g, '\n\n').trim();
   return s;
+}
+
+// Crew name extract + normalize (robust to punctuation/aliases)
+function crewFromString(s){
+  if(!s) return null;
+  const m = String(s).match(/crew\s*:\s*([^\n\r]+)/i);
+  if (!m || !m[1]) return null;
+  // take up to a common delimiter and strip parens/suffix
+  let v = m[1].split(/[|,·•\-\u2013\u2014]/)[0];
+  v = v.replace(/\(.*?\)/g,'');
+  v = v.replace(/[^A-Za-z\s]/g,''); // keep letters/spaces
+  return v.replace(/\s+/g,' ').trim();
+}
+function normalizeCrewName(s){
+  if(!s) return null;
+  let x = String(s).toLowerCase();
+  x = x.replace(/\s+/g,' ').trim();
+  // alias cleanups
+  if (x === 'anna') x = 'anna marie';
+  if (x === 'anna-marie') x = 'anna marie';
+  if (x === 'gregory') x = 'greg';
+  if (x === 'jonathan') x = 'johnathan';
+  return x;
 }
 
 // Signed URL for QR
@@ -215,15 +256,15 @@ function detectAssignee({ deal, activity }){
       return { teamId: dTid, teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
     }
   }
-  // 3) Fallback parse from title/subject
-  const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-  const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
-  if (name){
-    const key = name.toLowerCase();
+  // 3) Fallback parse from title/subject → robust & normalized
+  const rawName = crewFromString(deal?.title) || crewFromString(activity?.subject);
+  if (rawName){
+    const key = normalizeCrewName(rawName);
     const channelId = NAME_TO_CHANNEL[key] || null;
     const teamId = NAME_TO_TEAM_ID[key] || null;
-    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
+    const teamName = PRODUCTION_TEAM_MAP[teamId] || titleize(key);
     if (channelId) return { teamId, teamName, channelId };
+    console.warn('[WO] Crew fallback matched name but not mapped to channel:', rawName);
   }
   return { teamId:null, teamName:null, channelId:null };
 }
@@ -418,7 +459,7 @@ async function findAndDeleteActivityMessageInChannel(activityId, channelId, look
 function channelFromOldAssignment({ oldTeamId, oldCrewName }){
   if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId];
   if (oldCrewName){
-    const key = String(oldCrewName).toLowerCase();
+    const key = normalizeCrewName(String(oldCrewName));
     if (NAME_TO_CHANNEL[key]) return NAME_TO_CHANNEL[key];
   }
   return null;
@@ -521,19 +562,22 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (action === 'update') {
         const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-        const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-        const prevCrewName = prevCrew(prev?.subject);
+        const prevCrewNameRaw = crewFromString(prev?.subject);
+        const newCrewNameRaw = crewFromString(activity?.subject);
 
         const newAss = detectAssignee({ deal, activity });
         const oldChannel = (()=>{
           if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
-          if (prevCrewName) { const key = prevCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
+          if (prevCrewNameRaw) { const key = normalizeCrewName(prevCrewNameRaw); return NAME_TO_CHANNEL[key] || null; }
           return null;
         })();
 
+        const normalizedPrev = normalizeCrewName(prevCrewNameRaw);
+        const normalizedNew  = normalizeCrewName(newCrewNameRaw);
+
         const changed =
           (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
-          (prevCrewName && prevCrewName.toLowerCase() !== (newAss.teamName||'').toLowerCase());
+          (!!normalizedPrev && !!normalizedNew && normalizedPrev !== normalizedNew);
 
         if (changed && ENABLE_DELETE_ON_REASSIGN) {
           if (oldChannel) { console.log('[WO] activity.update → deleting old post in channel %s', oldChannel); await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400); }
@@ -557,13 +601,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
       const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-      const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-      const oldCrewName = crewNameFrom(prev?.title);
-      const newCrewName = crewNameFrom(deal?.title);
+      const oldCrewNameRaw = crewFromString(prev?.title);
+      const newCrewNameRaw = crewFromString(deal?.title);
 
       const teamChanged = oldTeamId !== newTeamId;
-      const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
-      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
+      const crewChanged = (normalizeCrewName(oldCrewNameRaw) || '') !== (normalizeCrewName(newCrewNameRaw) || '');
+      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewNameRaw, newCrewNameRaw);
       if (!teamChanged && !crewChanged) return res.status(200).send('OK');
 
       const assignee = detectAssignee({ deal, activity: null });
@@ -577,7 +620,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
-      const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName });
+      const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName: oldCrewNameRaw });
 
       for (const activity of items) {
         try {
