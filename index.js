@@ -559,10 +559,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const teamChanged = oldTeamId !== newTeamId;
       const crewChanged = (normalizeCrewName(oldCrewNameRaw) || '') !== (normalizeCrewName(newCrewNameRaw) || '');
-      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewNameRaw, newCrewNameRaw);
-      if (!teamChanged && !crewChanged) return res.status(200).send('OK');
 
+      // Resolve channels to catch changes even if 'previous' snapshot is partial
+      const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName: oldCrewNameRaw });
       const assignee = detectAssignee({ deal, activity: null });
+      const channelChanged = !!assignee.channelId && assignee.channelId !== oldChannel;
+
+      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s channelChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, channelChanged, oldTeamId, newTeamId, oldCrewNameRaw, newCrewNameRaw);
+      if (!teamChanged && !crewChanged && !channelChanged) return res.status(200).send('OK');
+
       if (!assignee.channelId) { console.log('[PD Hook] no assignee channel resolved for deal update'); return res.status(200).send('OK'); }
 
       let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
@@ -572,8 +577,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && hasDue(a) && !isBillingTask(a));
       console.log('[PD Hook] DEAL update → repost %d open scheduled activities', items.length);
-
-      const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName: oldCrewNameRaw });
 
       for (const activity of items) {
         try {
@@ -621,11 +624,37 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const newCrewNameRaw = crewFromString(activity?.subject);
 
         const newAss = detectAssignee({ deal, activity });
-        const oldChannel = (()=>{
-          if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
-          if (prevCrewNameRaw) { const key = normalizeCrewName(prevCrewNameRaw); return NAME_TO_CHANNEL[key] || null; }
-          return null;
-        })();
+
+        // Derive previous channel from previous snapshot (team or crew in subject)
+        let prevChannel = null;
+        if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) prevChannel = PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
+        else if (prevCrewNameRaw) { const key = normalizeCrewName(prevCrewNameRaw); prevChannel = NAME_TO_CHANNEL[key] || null; }
+
+        const normalizedPrev = normalizeCrewName(prevCrewNameRaw);
+        const normalizedNew  = normalizeCrewName(newCrewNameRaw);
+
+        let reassigned = false;
+        // 1) Direct field change comparisons
+        if (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) reassigned = true;
+        if (!!normalizedPrev && !!normalizedNew && normalizedPrev !== normalizedNew) reassigned = true;
+        // 2) Fallback channel comparison if previous payload was partial
+        if (!reassigned && prevChannel && newAss.channelId && prevChannel !== newAss.channelId) reassigned = true;
+
+        const scheduleBecameReal = becameScheduled(prev, activity);
+
+        if (reassigned && ENABLE_DELETE_ON_REASSIGN) {
+          if (prevChannel) { console.log('[WO] activity.update → deleting old post in channel %s', prevChannel); await findAndDeleteActivityMessageInChannel(activity.id, prevChannel, 400); }
+          await deleteAssigneePost(activity.id);
+        }
+
+        // Only post on update if reassigned OR it just became scheduled now
+        const allowPostLocal = reassigned || scheduleBecameReal;
+        if (!allowPostLocal) {
+          console.log('[WO] skip update; no reassignment and not newly scheduled. id=%s', activity.id);
+          return res.status(200).send('OK');
+        }
+        allowPost = true;
+      })();
 
         const normalizedPrev = normalizeCrewName(prevCrewNameRaw);
         const normalizedNew  = normalizeCrewName(newCrewNameRaw);
