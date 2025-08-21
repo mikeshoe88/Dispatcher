@@ -198,6 +198,20 @@ function buildPdfUrl(aid){
 // PD time normalization
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
+/* ======== Scheduling guards (to stop early/duplicate posts) ======== */
+const hasDue = (a)=> !!(a?.due_date || getTimeField(a?.due_time));
+const becameScheduled = (prev, curr)=> !hasDue(prev) && hasDue(curr);
+
+// In-memory idempotency: track what we've posted to avoid double posts from near-simultaneous hooks
+const POSTED_ACTIVITIES = new Map(); // activityId -> timestamp ms
+function alreadyPosted(aid, ttlMs = 5 * 60 * 1000){ // 5 minutes window
+  const now = Date.now();
+  const last = POSTED_ACTIVITIES.get(String(aid)) || 0;
+  if (last && (now - last) < ttlMs) return true;
+  POSTED_ACTIVITIES.set(String(aid), now);
+  return false;
+}
+
 /* ========= Channel resolution ========= */
 const channelCache = new Map(); // dealId -> channelId
 
@@ -543,58 +557,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
-    if (entity === 'activity' && (action === 'create' || action === 'update')) {
-      if (!data?.id) return res.status(200).send('No activity');
-      if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
-
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const aJson = await aRes.json();
-      if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
-      const activity = aJson.data;
-      if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
-
-      let deal = null;
-      if (activity.deal_id) {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-        const dJson = await dRes.json();
-        if (dJson?.success && dJson.data) deal = dJson.data;
-      }
-
-      if (action === 'update') {
-        const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-        const prevCrewNameRaw = crewFromString(prev?.subject);
-        const newCrewNameRaw = crewFromString(activity?.subject);
-
-        const newAss = detectAssignee({ deal, activity });
-        const oldChannel = (()=>{
-          if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
-          if (prevCrewNameRaw) { const key = normalizeCrewName(prevCrewNameRaw); return NAME_TO_CHANNEL[key] || null; }
-          return null;
-        })();
-
-        const normalizedPrev = normalizeCrewName(prevCrewNameRaw);
-        const normalizedNew  = normalizeCrewName(newCrewNameRaw);
-
-        const changed =
-          (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
-          (!!normalizedPrev && !!normalizedNew && normalizedPrev !== normalizedNew);
-
-        if (changed && ENABLE_DELETE_ON_REASSIGN) {
-          if (oldChannel) { console.log('[WO] activity.update → deleting old post in channel %s', oldChannel); await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400); }
-          await deleteAssigneePost(activity.id);
-        }
-      }
-
-      let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
-      const assignee = detectAssignee({ deal, activity });
-
-      console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
-
-      await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
-      return res.status(200).send('OK');
-    }
-
+    // 🔒 NEVER post on deal create; only handle deal UPDATE for re-routing existing open activities
     if (entity === 'deal' && action === 'update') {
       const deal = data;
       if (!deal?.id) return res.status(200).send('No deal');
@@ -617,8 +580,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
-      console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && hasDue(a)); // 🚧 only scheduled activities
+      console.log('[PD Hook] DEAL update → repost %d open scheduled activities', items.length);
 
       const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName: oldCrewNameRaw });
 
@@ -628,10 +591,88 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldChannel) await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 200);
             await deleteAssigneePost(activity.id);
           }
+          // de-dupe
+          if (ASSIGNEE_POSTS.has(String(activity.id))) { console.log('[WO] skip repost; already posted in current runtime', activity.id); continue; }
           await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
 
+      return res.status(200).send('OK');
+    }
+
+    if (entity === 'activity' && (action === 'create' || action === 'update')) {
+      if (!data?.id) return res.status(200).send('No activity');
+      if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
+
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aJson = await aRes.json();
+      if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
+      const activity = aJson.data;
+      if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
+
+      // 🚧 HARD GUARD: only create WO when activity is actually scheduled
+      const scheduledNow = hasDue(activity);
+      if (action === 'create' && !scheduledNow) {
+        console.log('[WO] skip create; unscheduled activity id=%s', activity.id);
+        return res.status(200).send('OK');
+      }
+
+      let deal = null;
+      if (activity.deal_id) {
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      }
+
+      let allowPost = false;
+
+      if (action === 'update') {
+        const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
+        const prevCrewNameRaw = crewFromString(prev?.subject);
+        const newCrewNameRaw = crewFromString(activity?.subject);
+
+        const newAss = detectAssignee({ deal, activity });
+        const oldChannel = (()=>{
+          if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
+          if (prevCrewNameRaw) { const key = normalizeCrewName(prevCrewNameRaw); return NAME_TO_CHANNEL[key] || null; }
+          return null;
+        })();
+
+        const normalizedPrev = normalizeCrewName(prevCrewNameRaw);
+        const normalizedNew  = normalizeCrewName(newCrewNameRaw);
+
+        const reassigned =
+          (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
+          (!!normalizedPrev && !!normalizedNew && normalizedPrev !== normalizedNew);
+
+        const scheduleBecameReal = becameScheduled(prev, activity);
+
+        if (reassigned && ENABLE_DELETE_ON_REASSIGN) {
+          if (oldChannel) { console.log('[WO] activity.update → deleting old post in channel %s', oldChannel); await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 400); }
+          await deleteAssigneePost(activity.id);
+        }
+
+        // Only post on update if reassigned OR it just became scheduled now
+        allowPost = reassigned || scheduleBecameReal;
+        if (!allowPost) {
+          console.log('[WO] skip update; no reassignment and not newly scheduled. id=%s', activity.id);
+          return res.status(200).send('OK');
+        }
+      }
+
+      // Guard against duplicate posts from near-simultaneous hooks
+      if (!ASSIGNEE_POSTS.has(String(activity.id)) && alreadyPosted(activity.id)) {
+        console.log('[WO] drop duplicate within window id=%s', activity.id);
+        return res.status(200).send('OK');
+      }
+
+      let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
+      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+      const assignee = detectAssignee({ deal, activity });
+
+      console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
+
+      await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
       return res.status(200).send('OK');
     }
 
