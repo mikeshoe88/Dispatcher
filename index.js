@@ -44,7 +44,6 @@ const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'
 const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
-// Use env first; fall back to old default only if provided (recommended: set env correctly)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
 // Production Team enum ID → Slack channel
@@ -155,44 +154,20 @@ function crewFromString(s){
   if(!s) return null;
   const m = String(s).match(/crew\s*:\s*([^\n\r]+)/i);
   if (!m || !m[1]) return null;
-  // take up to a common delimiter and strip parens/suffix
   let v = m[1].split(/[|,·•\-\u2013\u2014]/)[0];
   v = v.replace(/\(.*?\)/g,'');
-  v = v.replace(/[^A-Za-z\s]/g,''); // keep letters/spaces
+  v = v.replace(/[^A-Za-z\s]/g,'');
   return v.replace(/\s+/g,' ').trim();
 }
 function normalizeCrewName(s){
   if(!s) return null;
   let x = String(s).toLowerCase();
   x = x.replace(/\s+/g,' ').trim();
-  // alias cleanups
   if (x === 'anna') x = 'anna marie';
   if (x === 'anna-marie') x = 'anna marie';
   if (x === 'gregory') x = 'greg';
   if (x === 'jonathan') x = 'johnathan';
   return x;
-}
-
-// Signed URL for QR
-function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
-  const exp = Math.floor(Date.now()/1000)+ttlSeconds;
-  const raw = `${aid}.${did}.${cid}.${exp}`;
-  const params = new URLSearchParams({ aid:String(aid), exp:String(exp), sig:sign(raw) });
-  if (did) params.set('did', String(did));
-  if (cid) params.set('cid', String(cid));
-  return `${cleanBase()}/wo/complete?${params.toString()}`;
-}
-
-// Slack button URL
-function buildPdfUrl(aid){
-  try{
-    const base = new URL(cleanBase());
-    const u = new URL('/wo/pdf', base);
-    u.searchParams.set('aid', String(aid));
-    const href = u.toString();
-    if (!/^https?:\/\//i.test(href)) return null;
-    return href;
-  }catch(e){ console.error('[WO] buildPdfUrl error:', e?.message||e); return null; }
 }
 
 // PD time normalization
@@ -201,6 +176,13 @@ function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if
 /* ======== Scheduling guards (to stop early/duplicate posts) ======== */
 const hasDue = (a)=> !!(a?.due_date || getTimeField(a?.due_time));
 const becameScheduled = (prev, curr)=> !hasDue(prev) && hasDue(curr);
+
+// Ignore billing-type tasks entirely (subject or type contains billed/billing/invoice)
+const isBillingTask = (a) => {
+  const s = String(a?.subject || '').toLowerCase();
+  const t = String(a?.type || '').toLowerCase();
+  return /\bbilled\b|\bbilling\b|\binvoice\b/.test(s) || /\bbilled\b|\bbilling\b|\binvoice\b/.test(t);
+};
 
 // In-memory idempotency: track what we've posted to avoid double posts from near-simultaneous hooks
 const POSTED_ACTIVITIES = new Map(); // activityId -> timestamp ms
@@ -343,7 +325,6 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
   const doc = new PDFDocument({ margin: 50 });
   const chunks = [];
   doc.on('data', c => chunks.push(c));
-  // return a Buffer at end
   const finish = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
 
   doc.fontSize(20).text('Work Order Completed', { align: 'center' });
@@ -372,7 +353,6 @@ function buildSlackBlocks({ activity, noteText, dealId, dealTitle, typeOfService
   const scheduledText = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ') || 'No due date';
   const pdfUrl = buildPdfUrl(activity.id);
 
-  // ⚠️ QR-ONLY COMPLETION: no checkboxes here; only a "Open PDF" button
   const actionElements = [];
   if (pdfUrl) actionElements.push({ type:'button', text:{type:'plain_text', text:'Open Work Order PDF'}, url: pdfUrl });
 
@@ -391,6 +371,17 @@ function buildSlackBlocks({ activity, noteText, dealId, dealTitle, typeOfService
     }},
     ...(actionElements.length ? [{ type:'actions', elements: actionElements }] : [])
   ];
+}
+
+function buildPdfUrl(aid){
+  try{
+    const base = new URL(cleanBase());
+    const u = new URL('/wo/pdf', base);
+    u.searchParams.set('aid', String(aid));
+    const href = u.toString();
+    if (!/^https?:\/\//i.test(href)) return null;
+    return href;
+  }catch(e){ console.error('[WO] buildPdfUrl error:', e?.message||e); return null; }
 }
 
 async function uploadPdfToSlack({ channel, filename, pdfBuffer, title, initialComment='' }){
@@ -529,11 +520,10 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     ASSIGNEE_POSTS.set(String(activity.id), record);
   }
 
-  // Keep original PD upload of the *work order* PDF if desired
+  // Attach WO PDF to PD and leave a note (no completion link)
   if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
   if (ENABLE_PD_NOTE){
-    const completeUrl = makeSignedCompleteUrl({ aid:String(activity.id), did:String(dealId), cid: jobChannelId || DEFAULT_CHANNEL });
-    await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ deal_id: dealId, content: `Work Order posted to Slack.\nScan to complete: ${completeUrl}` }) });
+    await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ deal_id: dealId, content: `Work Order PDF posted to Slack and attached in Pipedrive.` }) });
   }
 }
 
@@ -580,7 +570,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && hasDue(a)); // 🚧 only scheduled activities
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && hasDue(a) && !isBillingTask(a));
       console.log('[PD Hook] DEAL update → repost %d open scheduled activities', items.length);
 
       const oldChannel = channelFromOldAssignment({ oldTeamId, oldCrewName: oldCrewNameRaw });
@@ -591,7 +581,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldChannel) await findAndDeleteActivityMessageInChannel(activity.id, oldChannel, 200);
             await deleteAssigneePost(activity.id);
           }
-          // de-dupe
           if (ASSIGNEE_POSTS.has(String(activity.id))) { console.log('[WO] skip repost; already posted in current runtime', activity.id); continue; }
           await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
@@ -609,8 +598,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
       if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
+      if (isBillingTask(activity)) { console.log('[WO] skip activity id=%s (billing task)', activity.id); return res.status(200).send('OK'); }
 
-      // 🚧 HARD GUARD: only create WO when activity is actually scheduled
       const scheduledNow = hasDue(activity);
       if (action === 'create' && !scheduledNow) {
         console.log('[WO] skip create; unscheduled activity id=%s', activity.id);
@@ -660,7 +649,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         }
       }
 
-      // Guard against duplicate posts from near-simultaneous hooks
       if (!ASSIGNEE_POSTS.has(String(activity.id)) && alreadyPosted(activity.id)) {
         console.log('[WO] drop duplicate within window id=%s', activity.id);
         return res.status(200).send('OK');
@@ -701,7 +689,6 @@ expressApp.get('/wo/complete', async (req, res) => {
     const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
-    // 1) Mark PD activity done (idempotent-ish)
     const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: new Date().toISOString() })
@@ -709,7 +696,6 @@ expressApp.get('/wo/complete', async (req, res) => {
     const pdJson = await pdResp.json();
     const ok = !!(pdJson && pdJson.success);
 
-    // 2) Fetch activity + deal (for PDF fields)
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -731,7 +717,6 @@ expressApp.get('/wo/complete', async (req, res) => {
       }
     } catch (e) { console.warn('[WO] fetch for completion PDF failed', e?.message||e); }
 
-    // 3) Generate and upload a *Completed Work Order* PDF to PD
     try {
       const completedPdf = await buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt: Date.now() });
       const up = await uploadPdfToPipedrive({ dealId: did || activity?.deal_id, pdfBuffer: completedPdf, filename: `WO_${aid}_Completed.pdf` });
@@ -740,10 +725,8 @@ expressApp.get('/wo/complete', async (req, res) => {
       console.error('[WO] completion PDF upload failed', e?.message||e);
     }
 
-    // 4) Clean up Slack WO message (if we posted one)
     await deleteAssigneePost(aid);
 
-    // 5) Notify channel
     const jobChannel = cid || DEFAULT_CHANNEL;
     if (jobChannel) {
       const text = ok ? `✅ Task *${aid}* marked complete in Pipedrive${did ? ` (deal ${did})` : ''}. PDF attached to deal.`
