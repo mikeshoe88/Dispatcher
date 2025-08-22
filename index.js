@@ -30,7 +30,10 @@ const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'fal
 
 // Optional: skip invoice/billing tasks entirely
 const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false'; // default true
-const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill ,payment request,collect payment,final invoice,send invoice').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
@@ -180,11 +183,29 @@ async function postPdNote({ dealId, content }){
 // PD time normalization
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
-// Invoice/billing detector
+// ====== Strict invoice/billing detector (prevents rename/posting) ======
 function isInvoiceLike(activity){
   if (!SKIP_INVOICE_TASKS) return false;
-  const hay = `${activity?.subject||''}\n${htmlToPlainText(activity?.note||'')}`.toLowerCase();
-  return INVOICE_KEYWORDS.some(k => k && hay.includes(k));
+
+  const subjectRaw = (activity?.subject || '').toLowerCase().trim();
+  const subject = subjectRaw.replace(/\s+/g, ' ');
+  const note = htmlToPlainText(activity?.note || '').toLowerCase();
+
+  // Exact subjects to ignore entirely
+  const EXACTS = (process.env.INVOICE_EXACT_SUBJECTS || 'billed/invoice,invoice,invoice task,collect payment,final invoice,bill in 5 days')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (EXACTS.includes(subject)) return true;
+  if (subject.startsWith('invoice:') || subject.startsWith('invoice -') || subject.startsWith('billed/')) return true;
+
+  // Boundary keyword match (avoid false positives like "billion")
+  const escaped = INVOICE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const re = new RegExp(`\\b(${escaped.join('|')})\\b`, 'i');
+  if (re.test(subject) || re.test(note)) return true;
+
+  return false;
 }
 
 /* ========= Channel resolution ========= */
@@ -466,6 +487,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
       if (!data?.id) return res.status(200).send('No activity');
+
+      // 🚫 Absolutely ignore invoice-like activities
+      if (isInvoiceLike(data)) { console.log('[PD Hook] skip activity id=%s (invoice-like)', data.id); return res.status(200).send('OK'); }
+
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
 
       // Fetch full activity
@@ -473,9 +498,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
-      if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
-      if (isInvoiceLike(activity)) { console.log('[PD Hook] skip invoice-like activity id=%s', activity.id); return res.status(200).send('OK'); }
+      // Re-check after fetch (in case subject changed)
+      if (isInvoiceLike(activity)) { console.log('[PD Hook] skip activity id=%s (invoice-like after fetch)', activity.id); return res.status(200).send('OK'); }
+
+      if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
       let deal = null;
       if (activity.deal_id) {
@@ -670,6 +697,9 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) return res.status(404).send('Activity not found');
     const data = aj.data;
+
+    // Hard stop for invoice-like activities (do not generate WOs)
+    if (isInvoiceLike(data)) return res.status(403).send('Forbidden for invoice activities');
 
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
