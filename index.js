@@ -35,6 +35,11 @@ const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,bille
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
+// ✅ NEW: Only manage Dispatcher Work Orders (WOs)
+const REQUIRE_WO_MARKER = process.env.REQUIRE_WO_MARKER !== 'false'; // default true
+const WO_ACTIVITY_TYPE = (process.env.WO_ACTIVITY_TYPE || 'workorder').toLowerCase();
+const WO_SUBJECT_PREFIX = (process.env.WO_SUBJECT_PREFIX || '[WO]').toLowerCase();
+
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
 if (!PIPEDRIVE_API_TOKEN) throw new Error('Missing PIPEDRIVE_API_TOKEN');
@@ -208,6 +213,14 @@ function isInvoiceLike(activity){
   return false;
 }
 
+// ====== NEW: Dispatcher WO detector (subject prefix or activity type) ======
+function isDispatcherWO(activity){
+  if (!REQUIRE_WO_MARKER) return true; // allow legacy behavior if explicitly disabled
+  const s = (activity?.subject || '').trim().toLowerCase();
+  const t = (activity?.type || '').trim().toLowerCase();
+  return t === WO_ACTIVITY_TYPE || s.startsWith(WO_SUBJECT_PREFIX);
+}
+
 /* ========= Channel resolution ========= */
 const channelCache = new Map(); // dealId -> channelId
 
@@ -292,7 +305,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   });
 
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
-  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/,'') ,'base64');
+  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,'') ,'base64');
 
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
@@ -499,9 +512,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
 
-      // Re-check after fetch (in case subject changed)
+      // Re-check after fetch (in case subject/type changed)
       if (isInvoiceLike(activity)) { console.log('[PD Hook] skip activity id=%s (invoice-like after fetch)', activity.id); return res.status(200).send('OK'); }
-
+      if (!isDispatcherWO(activity)) { console.log('[PD Hook] skip activity id=%s (not a WO)', activity.id); return res.status(200).send('OK'); }
       if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
       let deal = null;
@@ -568,7 +581,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && !isInvoiceLike(a));
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && !isInvoiceLike(a) && isDispatcherWO(a));
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
       const oldChannel = (()=>{
@@ -700,6 +713,8 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 
     // Hard stop for invoice-like activities (do not generate WOs)
     if (isInvoiceLike(data)) return res.status(403).send('Forbidden for invoice activities');
+    // Hard stop for non-WO activities unless explicitly disabled
+    if (!isDispatcherWO(data)) return res.status(403).send('Forbidden for non-work-order activities');
 
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
