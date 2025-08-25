@@ -1,4 +1,9 @@
-// index.js (ESM)
+const jobChannel = cid || await resolveDealChannelId({ dealId: dealIdForUpload, allowDefault: ALLOW_DEFAULT_FALLBACK }) || DEFAULT_CHANNEL;
+      if (jobChannel) {
+        // Always post completion PDF to job channel
+        await uploadPdfToSlack({ channel: jobChannel, filename: `WO_${aid}_Completed.pdf`, pdfBuffer: completedPdf, title: 'Work Order Completed', initialComment: `✅ Completed Work Order for activity ${aid}. ${AID_TAG(aid)}` });
+      }
+    } catch// index.js (ESM)
 import dotenv from 'dotenv'; dotenv.config();
 
 import fetch from 'node-fetch';
@@ -27,6 +32,22 @@ const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'fal
 const ENABLE_PD_NOTE            = false; // only attach WO PDF, not initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
+
+// Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
+// on_assigned = only post to job channel when a Production Team is set
+const JOB_CHANNEL_MODE = (process.env.JOB_CHANNEL_MODE || 'on_assigned').toLowerCase();
+const JOB_CHANNEL_MODES = new Set(['immediate','on_assigned','on_complete']);
+function shouldPostToJobChannel({ assigneeChannelId }) {
+  const mode = JOB_CHANNEL_MODES.has(JOB_CHANNEL_MODE) ? JOB_CHANNEL_MODE : 'on_assigned';
+  if (mode === 'immediate') return true;
+  if (mode === 'on_assigned') return !!assigneeChannelId; // only once assigned
+  if (mode === 'on_complete') return false; // never post until QR completion
+  return true;
+}
+
+// Job-channel content style: 'pdf' | 'summary'
+// summary = post a light text notice only (no PDF/notes) until completion
+const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
 // Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
 // on_assigned = only post to job channel when a Production Team is set
@@ -442,9 +463,24 @@ function buildSummary({ activity, deal, assigneeName, noteText }){
     `🏷️ Deal: ${dealId} — ${dealTitle}`,
     `📦 ${typeOfService}`,
     assigneeName ? `👷 ${assigneeName}` : null,
-    noteText || activity.note ? `\n📜 Notes:\n${htmlToPlainText(noteText || activity.note)}` : null,
-    `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
-  ].filter(Boolean).join('\n');
+    noteText || activity.note ? `
+📜 Notes:
+${htmlToPlainText(noteText || activity.note)}` : null,
+    `
+Scan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
+  ].filter(Boolean).join('
+');
+}
+
+function buildJobChannelNotice({ activity, deal, assigneeName }){
+  const dealTitle = deal?.title || 'N/A';
+  const subj = activity?.subject || 'Task';
+  const who = assigneeName || 'Unassigned';
+  return [
+    `🧭 *${subj}* has been assigned to *${who}*. ${AID_TAG(activity.id)}`,
+    `📨 Work order delivered to ${who === 'Unassigned' ? 'assignee channel' : `*${who}*'s channel`}.`
+  ].join('
+');
 }
 
 /* ========= Core post ========= */
@@ -484,10 +520,14 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   // Job channel (respect mode + active deal)
   if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
-    if (ENABLE_SLACK_PDF_UPLOAD){
-      try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); }
-      catch(e){ console.warn('[WO] files.uploadV2 (job) failed:', e?.data || e?.message || e); }
-    }
+    try {
+      if (JOB_CHANNEL_STYLE === 'summary') {
+        const notice = buildJobChannelNotice({ activity, deal, assigneeName });
+        await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
+      } else if (ENABLE_SLACK_PDF_UPLOAD) {
+        await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
+      }
+    } catch(e){ console.warn('[WO] job channel post failed:', e?.data || e?.message || e); }
   }
 
   // Assignee channel (personal) — always post for their workflow
