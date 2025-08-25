@@ -28,17 +28,6 @@ const ENABLE_PD_NOTE            = false; // ⛔️ initial PD note removed per r
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 
-// Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
-const JOB_CHANNEL_MODE = (process.env.JOB_CHANNEL_MODE || 'on_complete').toLowerCase();
-const JOB_CHANNEL_MODES = new Set(['immediate','on_assigned','on_complete']);
-function shouldPostToJobChannel({ assigneeChannelId }) {
-  const mode = JOB_CHANNEL_MODES.has(JOB_CHANNEL_MODE) ? JOB_CHANNEL_MODE : 'immediate';
-  if (mode === 'immediate') return true;                  // current behavior
-  if (mode === 'on_assigned') return !!assigneeChannelId; // only once crew set
-  if (mode === 'on_complete') return false;               // never for initial WO
-  return true;
-}
-
 // Optional: skip invoice/billing tasks entirely
 const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false'; // default true
 const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice')
@@ -56,6 +45,37 @@ if (!PD_WEBHOOK_KEY) console.warn('⚠️ PD_WEBHOOK_KEY not set; /pipedrive-tas
 // Crash handlers
 process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection:', r?.stack||r));
 process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
+
+/* ========= Anti-spam guards (small + safe) ========= */
+const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14); // default 14 days (set 0 to disable)
+
+// In-memory idempotency cache so repeated updates in a burst don't double-post
+const POSTED_CACHE = new Map(); // key -> expiresAt (ms)
+const POST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function alreadyHandled(activity){
+  const version = String(activity.update_time || activity.add_time || '');
+  const key = `aid:${activity.id}|v:${version}`;
+  const now = Date.now();
+  const exp = POSTED_CACHE.get(key);
+  if (exp && exp > now) return true;
+  // occasional sweep
+  if (POSTED_CACHE.size > 500){
+    for (const [k, t] of POSTED_CACHE){ if (t <= now) POSTED_CACHE.delete(k); }
+  }
+  POSTED_CACHE.set(key, now + POST_CACHE_TTL_MS);
+  return false;
+}
+
+function isActivityFresh(activity, maxDays = MAX_ACTIVITY_AGE_DAYS){
+  if (!maxDays) return true;
+  const now = Date.now();
+  const due = activity?.due_date ? new Date(activity.due_date) : null;
+  const add = activity?.add_time ? new Date(String(activity.add_time).replace(' ', 'T')) : null;
+  const ref = due || add;
+  if (!ref || isNaN(ref)) return true; // if we can't tell, allow
+  return (now - ref.getTime()) <= maxDays * 86400000;
+}
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
@@ -303,7 +323,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   });
 
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
-  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,'') ,'base64');
+  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/,'') ,'base64');
 
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
@@ -447,8 +467,8 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
   ].filter(Boolean).join('\n');
 
-  // Only post the initial WO to the job channel per JOB_CHANNEL_MODE
-  if (jobChannelId && shouldPostToJobChannel({ assigneeChannelId })){
+  // Post to job channel (existing behavior)
+  if (jobChannelId){
     await ensureBotInChannel(jobChannelId);
     if (ENABLE_SLACK_PDF_UPLOAD){
       try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); }
@@ -510,6 +530,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
 
+      // Calm-down guards (idempotency + freshness)
+      if (alreadyHandled(activity)) { console.log('[WO] duplicate burst for activity; skipping', activity.id); return res.status(200).send('OK'); }
+      if (!isActivityFresh(activity)) { console.log('[WO] stale activity; skipping', activity.id); return res.status(200).send('OK'); }
+
       // Re-check after fetch (in case subject changed)
       if (isInvoiceLike(activity)) { console.log('[PD Hook] skip activity id=%s (invoice-like after fetch)', activity.id); return res.status(200).send('OK'); }
 
@@ -520,30 +544,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
-      }
-
-      if (action === 'update') {
-        const prevTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-        const prevCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-        const prevCrewName = prevCrew(prev?.subject);
-
-        const newAss = detectAssignee({ deal, activity });
-        const oldChannel = (()=>{
-          if (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[prevTeamId];
-          if (prevCrewName) { const key = prevCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
-          return null;
-        })();
-
-        const changed =
-          (prevTeamId !== undefined && prevTeamId !== activity[PRODUCTION_TEAM_FIELD_KEY]) ||
-          (prevCrewName && prevCrewName.toLowerCase() !== (newAss.teamName||'').toLowerCase());
-
-        if (changed && ENABLE_DELETE_ON_REASSIGN) {
-          if (oldChannel) { console.log('[WO] activity.update → deleting old post in channel %s', oldChannel); await deleteAssigneePdfByMarker(activity.id, oldChannel, 400); }
-          await deleteAssigneePost(activity.id);
-          const oldJobChannel = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-          if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
-        }
       }
 
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
@@ -582,7 +582,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const items = (listJson?.data || []).filter(a => {
         if (!a || a.done === true || a.done === 1) return false;
         if (String(a.type || '').toLowerCase() === 'invoice') return false;
-        return !isInvoiceLike(a);
+        if (isInvoiceLike(a)) return false;
+        if (!isActivityFresh(a)) return false;
+        return true;
       });
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
@@ -600,6 +602,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             const oldJobChannel = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
+
+          // Calm-down guards in reroute loop
+          if (alreadyHandled(activity)) { console.log('[WO] duplicate during deal reroute; skipping', activity.id); continue; }
+          if (!isActivityFresh(activity)) { console.log('[WO] stale during deal reroute; skipping', activity.id); continue; }
+
           await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
