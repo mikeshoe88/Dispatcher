@@ -28,6 +28,17 @@ const ENABLE_PD_NOTE            = false; // ⛔️ initial PD note removed per r
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 
+// Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
+const JOB_CHANNEL_MODE = (process.env.JOB_CHANNEL_MODE || 'on_complete').toLowerCase();
+const JOB_CHANNEL_MODES = new Set(['immediate','on_assigned','on_complete']);
+function shouldPostToJobChannel({ assigneeChannelId }) {
+  const mode = JOB_CHANNEL_MODES.has(JOB_CHANNEL_MODE) ? JOB_CHANNEL_MODE : 'immediate';
+  if (mode === 'immediate') return true;                  // current behavior
+  if (mode === 'on_assigned') return !!assigneeChannelId; // only once crew set
+  if (mode === 'on_complete') return false;               // never for initial WO
+  return true;
+}
+
 // Optional: skip invoice/billing tasks entirely
 const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false'; // default true
 const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice')
@@ -292,7 +303,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   });
 
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
-  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/,'') ,'base64');
+  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,'') ,'base64');
 
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
@@ -436,8 +447,8 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
   ].filter(Boolean).join('\n');
 
-  // Only the PDF posts (no separate chat.postMessage) — prevents double posts in Slack
-  if (jobChannelId){
+  // Only post the initial WO to the job channel per JOB_CHANNEL_MODE
+  if (jobChannelId && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
     if (ENABLE_SLACK_PDF_UPLOAD){
       try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); }
@@ -568,7 +579,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && !isInvoiceLike(a));
+      const items = (listJson?.data || []).filter(a => {
+        if (!a || a.done === true || a.done === 1) return false;
+        if (String(a.type || '').toLowerCase() === 'invoice') return false;
+        return !isInvoiceLike(a);
+      });
       console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
 
       const oldChannel = (()=>{
