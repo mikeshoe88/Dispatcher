@@ -314,6 +314,45 @@ function detectAssignee({ deal, activity }){
 const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
 const AID_TAG = (id)=>`[AID:${id}]`;
 
+/* ========= Subject shortener for notices ========= */
+function subjectShort(subject=''){
+  const s = String(subject).toLowerCase();
+  const map = [
+    { re: /moisture\s*check|\bmc\b/, label: 'MC' },
+    { re: /water\s*(damage)?\s*demo|wd\s*demo/, label: 'WD demo' },
+    { re: /new[_\s-]*water[_\s-]*damage|water\s*mitigation|\bwm\b/, label: 'Water Mitigation' },
+    { re: /fire/, label: 'Fire Cleanup' },
+    { re: /contents?/, label: 'Contents' },
+  ];
+  for (const m of map){ if (m.re.test(s)) return m.label; }
+  // default: use first 28 chars of original subject
+  const raw = String(subject || 'Work Order').trim();
+  return raw.length > 28 ? raw.slice(0,28) + '…' : raw || 'Work Order';
+}
+
+/* ========= Assignment notice ========= */
+async function postAssignmentNotice({ activity, deal, assigneeChannelId, assigneeName }){
+  if (!assigneeChannelId) return;
+  const short = subjectShort(activity?.subject || deal?.title || 'Work Order');
+  const scheduledText = [activity?.due_date, getTimeField(activity?.due_time)].filter(Boolean).join(' ') || 'No due date';
+  const topNote = htmlToPlainText(activity?.note || '').split('\n').filter(Boolean)[0] || '';
+  const brief = topNote && topNote.length > 160 ? topNote.slice(0,157) + '…' : topNote;
+
+  const lines = [
+    `:white_check_mark: *${short}* has been assigned to *${assigneeName || 'Crew'}* ${AID_TAG(activity?.id)}`,
+    `• Deal: ${deal?.id || 'N/A'} — *${deal?.title || 'N/A'}*`,
+    `• Due: ${scheduledText}`,
+  ];
+  if (brief) lines.push(`:scroll: ${brief}`);
+
+  try {
+    await ensureBotInChannel(assigneeChannelId);
+    await app.client.chat.postMessage({ channel: assigneeChannelId, text: lines.join('\n') });
+  } catch (e) {
+    console.warn('[WO] assignment notice failed', e?.data || e?.message || e);
+  }
+}
+
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
   const completeUrl = makeSignedCompleteUrl({
@@ -323,7 +362,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   });
 
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
-  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/,'') ,'base64');
+  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,''),'base64');
 
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
@@ -552,6 +591,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
 
+      // For activity create/update we keep existing behavior (post full WO once per burst)
       await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
       return res.status(200).send('OK');
     }
@@ -586,7 +626,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         if (!isActivityFresh(a)) return false;
         return true;
       });
-      console.log('[PD Hook] DEAL update → repost %d open activities', items.length);
+      console.log('[PD Hook] DEAL update → open activities to reroute: %d', items.length);
 
       const oldChannel = (()=>{
         if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId];
@@ -596,6 +636,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       for (const activity of items) {
         try {
+          // On reassignment: delete old assignee posts + PDFs, DO NOT repost full WO → send lightweight notice only
           if (ENABLE_DELETE_ON_REASSIGN) {
             if (oldChannel) await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
             await deleteAssigneePost(activity.id);
@@ -607,7 +648,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           if (alreadyHandled(activity)) { console.log('[WO] duplicate during deal reroute; skipping', activity.id); continue; }
           if (!isActivityFresh(activity)) { console.log('[WO] stale during deal reroute; skipping', activity.id); continue; }
 
-          await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
+          // 🔔 Lightweight notice only
+          await postAssignmentNotice({ activity, deal, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName });
+
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
 
