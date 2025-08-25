@@ -59,10 +59,7 @@ function alreadyHandled(activity){
   const now = Date.now();
   const exp = POSTED_CACHE.get(key);
   if (exp && exp > now) return true;
-  // occasional sweep
-  if (POSTED_CACHE.size > 500){
-    for (const [k, t] of POSTED_CACHE){ if (t <= now) POSTED_CACHE.delete(k); }
-  }
+  if (POSTED_CACHE.size > 500){ for (const [k, t] of POSTED_CACHE){ if (t <= now) POSTED_CACHE.delete(k); } }
   POSTED_CACHE.set(key, now + POST_CACHE_TTL_MS);
   return false;
 }
@@ -104,18 +101,9 @@ const PRODUCTION_TEAM_TO_CHANNEL = {
 
 // Fallback name→channel for parsing "Crew: Name"
 const NAME_TO_CHANNEL = {
-  anastacio:'C09BA0XUAV7',
-  mike:'C098H8GU355',
-  greg:'C09BFFGBYTB',
-  amber:'C09B49MJHEE',
-  'anna marie':'C09B85LE544',
-  annamarie:'C09B85LE544',
-  kings:'C09BXCCD95W',
-  penabad:'C09ASBE36Q7',
-  johnathan:'C09ASB1N32B',
-  gary:'C09AZ63JEJF',
-  hector:'C09B6P5LVPY',
-  sebastian:'C09AZ6VT459'
+  anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB', amber:'C09B49MJHEE',
+  'anna marie':'C09B85LE544', annamarie:'C09B85LE544', kings:'C09BXCCD95W', penabad:'C09ASBE36Q7',
+  johnathan:'C09ASB1N32B', gary:'C09AZ63JEJF', hector:'C09B6P5LVPY', sebastian:'C09AZ6VT459'
 };
 const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55, amber:56, 'anna marie':57, annamarie:57, kings:47, penabad:49, johnathan:48, gary:54, hector:50, sebastian:51 };
 
@@ -141,11 +129,7 @@ expressApp.get('/healthz', (_req,res)=>res.status(200).send('ok'));
 const b64url = (b)=>Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 const sign = (raw)=>b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
 function verify(raw,sig){
-  try{
-    const a=Buffer.from(sign(raw)), b=Buffer.from(String(sig));
-    if(a.length!==b.length) return false;
-    return crypto.timingSafeEqual(a,b);
-  }catch{ return false; }
+  try{ const a=Buffer.from(sign(raw)), b=Buffer.from(String(sig)); if(a.length!==b.length) return false; return crypto.timingSafeEqual(a,b);}catch{ return false; }
 }
 const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
 
@@ -176,18 +160,13 @@ function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
   return `${cleanBase()}/wo/complete?${params.toString()}`;
 }
 
-// Slack file upload helper
+// Slack helpers
 async function uploadPdfToSlack({ channel, filename, pdfBuffer, title, initialComment='' }){
-  return app.client.files.uploadV2({
-    channel_id: channel,
-    file: pdfBuffer,
-    filename,
-    title: title||filename,
-    initial_comment: initialComment
-  });
+  return app.client.files.uploadV2({ channel_id: channel, file: pdfBuffer, filename, title: title||filename, initial_comment: initialComment });
 }
+async function ensureBotInChannel(channelId){ if (!channelId) return; try{ await app.client.conversations.join({ channel: channelId }); } catch{} }
 
-// PD upload helper
+// PD helpers
 async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
   if(!dealId || dealId==='N/A') return;
   const form = new FormData();
@@ -198,115 +177,45 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
   if(!j?.success){ console.error('PD file upload failed:', j); throw new Error('PD file upload failed'); }
   return j;
 }
-
-// PD note (used on completion only)
-async function postPdNote({ dealId, content }){
-  if(!dealId) return;
-  try{
-    const resp = await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`,{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ deal_id: dealId, content })
-    });
-    return await resp.json();
-  }catch(e){ console.error('[WO] PD note failed', e?.message||e); }
-}
+async function postPdNote({ dealId, content }){ if(!dealId) return; try{ const resp = await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`,{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ deal_id: dealId, content }) }); return await resp.json(); }catch(e){ console.error('[WO] PD note failed', e?.message||e); } }
 
 // PD time normalization
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
-// ====== Strict invoice/billing detector (prevents rename/posting) ======
-function isInvoiceLike(activity){
-  if (!SKIP_INVOICE_TASKS) return false;
-
-  const subjectRaw = (activity?.subject || '').toLowerCase().trim();
-  const subject = subjectRaw.replace(/\s+/g, ' ');
-  const note = htmlToPlainText(activity?.note || '').toLowerCase();
-
-  // Exact subjects to ignore entirely
-  const EXACTS = (process.env.INVOICE_EXACT_SUBJECTS || 'billed/invoice,invoice,invoice task,collect payment,final invoice,bill in 5 days')
-    .split(',')
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (EXACTS.includes(subject)) return true;
-  if (subject.startsWith('invoice:') || subject.startsWith('invoice -') || subject.startsWith('billed/')) return true;
-
-  // Boundary keyword match (avoid false positives like "billion")
-  const escaped = INVOICE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const re = new RegExp(`\\b(${escaped.join('|')})\\b`, 'i');
-  if (re.test(subject) || re.test(note)) return true;
-
-  return false;
-}
-
 /* ========= Channel resolution ========= */
 const channelCache = new Map(); // dealId -> channelId
-
 async function findDealChannelId(dealId){
   if (!dealId) return null;
   const key = String(dealId);
   if (channelCache.has(key)) return channelCache.get(key);
-
   const tokens = [`deal${key}`,'deal-'+key,'deal_'+key, `${key}`, `${key}-deal`, `${key}_deal`, `job${key}`,'job-'+key,'job_'+key];
   let cursor, seen = new Set();
   while (true){
     const resp = await app.client.conversations.list({ types:'public_channel,private_channel', limit:1000, cursor, exclude_archived:true });
     for (const c of (resp.channels||[])){
-      if (!c?.id || !c?.name) continue;
-      if (seen.has(c.id)) continue; seen.add(c.id);
+      if (!c?.id || !c?.name) continue; if (seen.has(c.id)) continue; seen.add(c.id);
       const exact = tokens.includes(c.name);
       const suffix = tokens.some(t => c.name.endsWith(t));
       const strip = s => String(s).toLowerCase().replace(/[^a-z0-9]/g,'');
       const fuzzy = strip(c.name).includes(strip(`deal${key}`));
-      if (exact || suffix || fuzzy){
-        channelCache.set(key, c.id);
-        return c.id;
-      }
+      if (exact || suffix || fuzzy){ channelCache.set(key, c.id); return c.id; }
     }
-    if (!resp.response_metadata?.next_cursor) break;
-    cursor = resp.response_metadata.next_cursor;
+    if (!resp.response_metadata?.next_cursor) break; cursor = resp.response_metadata.next_cursor;
   }
   return null;
 }
-
-async function ensureBotInChannel(channelId){
-  if (!channelId) return;
-  try{ await app.client.conversations.join({ channel: channelId }); }
-  catch{ /* already_in_channel etc. */ }
-}
-
-async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }){
-  const byDeal = await findDealChannelId(dealId);
-  if (byDeal) return byDeal;
-  return allowDefault ? DEFAULT_CHANNEL : null;
-}
+async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }){ const byDeal = await findDealChannelId(dealId); if (byDeal) return byDeal; return allowDefault ? DEFAULT_CHANNEL : null; }
 
 /* ========= Assignee detection ========= */
 function detectAssignee({ deal, activity }){
   // 1) Activity-level Production Team
-  if (activity) {
-    const aTid = activity[PRODUCTION_TEAM_FIELD_KEY];
-    if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) {
-      return { teamId: aTid, teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
-    }
-  }
+  if (activity) { const aTid = activity[PRODUCTION_TEAM_FIELD_KEY]; if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) { return { teamId: aTid, teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] }; } }
   // 2) Deal-level Production Team
-  if (deal) {
-    const dTid = deal[PRODUCTION_TEAM_FIELD_KEY];
-    if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) {
-      return { teamId: dTid, teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
-    }
-  }
+  if (deal) { const dTid = deal[PRODUCTION_TEAM_FIELD_KEY]; if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) { return { teamId: dTid, teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] }; } }
   // 3) Fallback parse from title/subject
   const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
-  if (name){
-    const key = name.toLowerCase();
-    const channelId = NAME_TO_CHANNEL[key] || null;
-    const teamId = NAME_TO_TEAM_ID[key] || null;
-    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
-    if (channelId) return { teamId, teamName, channelId };
-  }
+  if (name){ const key = name.toLowerCase(); const channelId = NAME_TO_CHANNEL[key] || null; const teamId = NAME_TO_TEAM_ID[key] || null; const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1)); if (channelId) return { teamId, teamName, channelId }; }
   return { teamId:null, teamName:null, channelId:null };
 }
 
@@ -325,7 +234,6 @@ function subjectShort(subject=''){
     { re: /contents?/, label: 'Contents' },
   ];
   for (const m of map){ if (m.re.test(s)) return m.label; }
-  // default: use first 28 chars of original subject
   const raw = String(subject || 'Work Order').trim();
   return raw.length > 28 ? raw.slice(0,28) + '…' : raw || 'Work Order';
 }
@@ -337,45 +245,24 @@ async function postAssignmentNotice({ activity, deal, assigneeChannelId, assigne
   const scheduledText = [activity?.due_date, getTimeField(activity?.due_time)].filter(Boolean).join(' ') || 'No due date';
   const topNote = htmlToPlainText(activity?.note || '').split('\n').filter(Boolean)[0] || '';
   const brief = topNote && topNote.length > 160 ? topNote.slice(0,157) + '…' : topNote;
-
   const lines = [
     `:white_check_mark: *${short}* has been assigned to *${assigneeName || 'Crew'}* ${AID_TAG(activity?.id)}`,
     `• Deal: ${deal?.id || 'N/A'} — *${deal?.title || 'N/A'}*`,
     `• Due: ${scheduledText}`,
   ];
   if (brief) lines.push(`:scroll: ${brief}`);
-
-  try {
-    await ensureBotInChannel(assigneeChannelId);
-    await app.client.chat.postMessage({ channel: assigneeChannelId, text: lines.join('\n') });
-  } catch (e) {
-    console.warn('[WO] assignment notice failed', e?.data || e?.message || e);
-  }
+  try { await ensureBotInChannel(assigneeChannelId); await app.client.chat.postMessage({ channel: assigneeChannelId, text: lines.join('\n') }); } catch (e) { console.warn('[WO] assignment notice failed', e?.data || e?.message || e); }
 }
 
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
-  const completeUrl = makeSignedCompleteUrl({
-    aid: String(activity.id),
-    did: activity.deal_id ? String(activity.deal_id) : '',
-    cid: channelForQR || DEFAULT_CHANNEL,
-  });
-
+  const completeUrl = makeSignedCompleteUrl({ aid: String(activity.id), did: activity.deal_id ? String(activity.deal_id) : '', cid: channelForQR || DEFAULT_CHANNEL });
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
   const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,''),'base64');
-
   const doc = new PDFDocument({ margin: 36 });
-  const chunks = [];
-  doc.on('data', c => chunks.push(c));
-  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
-
-  doc.fontSize(20).text('Work Order', { align:'center' });
-  doc.moveDown(0.25);
-  doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' });
-  doc.moveDown(1);
-
+  const chunks = []; doc.on('data', c => chunks.push(c)); const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
+  doc.fontSize(20).text('Work Order', { align:'center' }); doc.moveDown(0.25); doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' }); doc.moveDown(1);
   const scheduled = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ').trim();
-
   doc.fillColor('#000').fontSize(12);
   doc.text(`Task: ${activity.subject || '-'}`);
   doc.text(`Due:  ${scheduled || '-'}`);
@@ -386,86 +273,26 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.text(`Address: ${location || '-'}`);
   if (assigneeName) doc.text(`Assigned To: ${assigneeName}`);
   doc.moveDown(0.5);
-
   const rawNote = htmlToPlainText(activity.note || '');
-  if (rawNote) {
-    doc.font('Helvetica-Bold').text('Scope / Notes');
-    doc.font('Helvetica').text(rawNote, { width: 520 });
-    doc.moveDown(0.5);
-  }
-
-  doc.font('Helvetica-Bold').text('Scan to Complete');
-  doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive.');
-  doc.moveDown(0.5);
-  doc.image(qrBuffer, { fit:[120,120] });
-  doc.moveDown(0.25);
-  doc.fontSize(8).fillColor('#777').text(completeUrl, { width: 520 });
-
-  doc.end();
-  return done;
+  if (rawNote) { doc.font('Helvetica-Bold').text('Scope / Notes'); doc.font('Helvetica').text(rawNote, { width: 520 }); doc.moveDown(0.5); }
+  doc.font('Helvetica-Bold').text('Scan to Complete'); doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive.'); doc.moveDown(0.5);
+  doc.image(qrBuffer, { fit:[120,120] }); doc.moveDown(0.25); doc.fontSize(8).fillColor('#777').text(completeUrl, { width: 520 });
+  doc.end(); return done;
 }
 
 function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt }) {
-  const doc = new PDFDocument({ margin: 50 });
-  const chunks = [];
-  doc.on('data', c => chunks.push(c));
-  const finish = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
-
-  doc.fontSize(20).text('Work Order Completed', { align: 'center' });
-  doc.moveDown();
-  doc.fontSize(12)
-     .text(`Task: ${activity?.subject || '-'}`)
-     .text(`Activity ID: ${activity?.id || '-'}`)
-     .text(`Deal: ${dealTitle || '-'}`)
-     .text(`Type of Service: ${typeOfService || '-'}`)
-     .text(`Location: ${location || '-'}`)
-     .text(`Completed At: ${new Date(completedAt || Date.now()).toLocaleString()}`);
-
-  const rawNote = htmlToPlainText(activity?.note || '');
-  if (rawNote) {
-    doc.moveDown();
-    doc.font('Helvetica-Bold').text('Final Notes');
-    doc.font('Helvetica').text(rawNote, { width: 520 });
-  }
-
-  doc.end();
-  return finish;
+  const doc = new PDFDocument({ margin: 50 }); const chunks = []; doc.on('data', c => chunks.push(c)); const finish = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
+  doc.fontSize(20).text('Work Order Completed', { align: 'center' }); doc.moveDown();
+  doc.fontSize(12).text(`Task: ${activity?.subject || '-'}`).text(`Activity ID: ${activity?.id || '-'}`).text(`Deal: ${dealTitle || '-'}`).text(`Type of Service: ${typeOfService || '-'}`).text(`Location: ${location || '-'}`).text(`Completed At: ${new Date(completedAt || Date.now()).toLocaleString()}`);
+  const rawNote = htmlToPlainText(activity?.note || ''); if (rawNote) { doc.moveDown(); doc.font('Helvetica-Bold').text('Final Notes'); doc.font('Helvetica').text(rawNote, { width: 520 }); }
+  doc.end(); return finish;
 }
 
 /* ========= Delete helpers ========= */
 async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
-  try{
-    const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
-    for (const m of (h?.messages||[])){
-      const text = (m.text||'') + ' ' + (m.previous_message?.text||'');
-      if (text.includes(AID_TAG(activityId))){
-        const files = m.files || [];
-        for (const f of files){
-          try{ await app.client.files.delete({ file: f.id }); } catch(e){ console.warn('[WO] files.delete (marker) failed', f.id, e?.data||e?.message||e); }
-        }
-        try{ await app.client.chat.delete({ channel: channelId, ts: m.ts }); } catch(e){ /* ignore */ }
-      }
-    }
-  }catch(e){ console.warn('[WO] deleteAssigneePdfByMarker failed', channelId, e?.data||e?.message||e); }
+  try{ const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true }); for (const m of (h?.messages||[])){ const text = (m.text||'') + ' ' + (m.previous_message?.text||''); if (text.includes(AID_TAG(activityId))){ const files = m.files || []; for (const f of files){ try{ await app.client.files.delete({ file: f.id }); } catch(e){ console.warn('[WO] files.delete (marker) failed', f.id, e?.data||e?.message||e); } } try{ await app.client.chat.delete({ channel: channelId, ts: m.ts }); } catch(e){} } } }catch(e){ console.warn('[WO] deleteAssigneePdfByMarker failed', channelId, e?.data||e?.message||e); }
 }
-
-async function deleteAssigneePost(activityId){
-  const key = String(activityId);
-  const rec = ASSIGNEE_POSTS.get(key);
-  if (rec){
-    const { assigneeChannelId, messageTs, fileIds } = rec;
-    if (assigneeChannelId && messageTs){
-      try { await app.client.chat.delete({ channel: assigneeChannelId, ts: messageTs }); } catch (e){ /* ignore */ }
-      await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400);
-    } else if (assigneeChannelId) {
-      await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400);
-    }
-    if (Array.isArray(fileIds)){
-      for (const fid of fileIds){ if (!fid) continue; try { await app.client.files.delete({ file: fid }); } catch(e){} }
-    }
-    ASSIGNEE_POSTS.delete(key);
-  }
-}
+async function deleteAssigneePost(activityId){ const key = String(activityId); const rec = ASSIGNEE_POSTS.get(key); if (rec){ const { assigneeChannelId, messageTs, fileIds } = rec; if (assigneeChannelId && messageTs){ try { await app.client.chat.delete({ channel: assigneeChannelId, ts: messageTs }); } catch (e){} await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400); } else if (assigneeChannelId) { await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400); } if (Array.isArray(fileIds)){ for (const fid of fileIds){ if (!fid) continue; try { await app.client.files.delete({ file: fid }); } catch(e){} } } ASSIGNEE_POSTS.delete(key); } }
 
 /* ========= Core post ========= */
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
@@ -475,63 +302,14 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
   const location = deal?.location || 'N/A';
   let customerName = null;
-  try {
-    const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
-    if (pid) {
-      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const pjson = await pres.json();
-      if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
-    }
-  } catch {}
-
-  const pdfBuffer = await buildWorkOrderPdfBuffer({
-    activity, dealTitle, typeOfService, location,
-    channelForQR: jobChannelId || DEFAULT_CHANNEL, assigneeName,
-    customerName, jobNumber: deal?.id
-  });
-
+  try { const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id; if (pid) { const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`); const pjson = await pres.json(); if (pjson?.success && pjson.data) customerName = pjson.data.name || null; } } catch {}
+  const pdfBuffer = await buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR: jobChannelId || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
   const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
   const scheduledText = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ') || 'No due date';
-  const summary = [
-    `📌 *Work Order* • *${activity.subject || '-'}*`,
-    `🗓️ ${scheduledText}`,
-    `🏷️ Deal: ${dealId} — *${dealTitle}*`,
-    customerName ? `👤 ${customerName}` : null,
-    `#️⃣ Job Number: ${deal?.id || 'N/A'}`,
-    `📦 ${typeOfService}`,
-    `📍 ${location}`,
-    assigneeName ? `👷 ${assigneeName}` : null,
-    noteText || activity.note ? `\n📜 Notes:\n${htmlToPlainText(noteText || activity.note)}` : null,
-    `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
-  ].filter(Boolean).join('\n');
-
-  // Post to job channel (existing behavior)
-  if (jobChannelId){
-    await ensureBotInChannel(jobChannelId);
-    if (ENABLE_SLACK_PDF_UPLOAD){
-      try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); }
-      catch(e){ console.warn('[WO] files.uploadV2 (job) failed:', e?.data || e?.message || e); }
-    }
-  }
-
-  if (assigneeChannelId){
-    await ensureBotInChannel(assigneeChannelId);
-
-    if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
-
-    if (ENABLE_SLACK_PDF_UPLOAD){
-      try {
-        const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
-        const fids = [];
-        if (up?.files && Array.isArray(up.files)) { for (const f of up.files) if (f?.id) fids.push(f.id); }
-        else if (up?.file?.id) { fids.push(up.file.id); }
-        const aMsgTs = up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts || up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts || null;
-        ASSIGNEE_POSTS.set(String(activity.id), { assigneeChannelId, messageTs: aMsgTs, fileIds: fids });
-      } catch(e){ console.warn('[WO] files.uploadV2 (assignee) failed:', e?.data || e?.message || e); }
-    }
-  }
-
+  const summary = [ `📌 *Work Order* • *${activity.subject || '-'}*`, `🗓️ ${scheduledText}`, `🏷️ Deal: ${dealId} — *${dealTitle}*`, customerName ? `👤 ${customerName}` : null, `#️⃣ Job Number: ${deal?.id || 'N/A'}`, `📦 ${typeOfService}`, `📍 ${location}`, assigneeName ? `👷 ${assigneeName}` : null, noteText || activity.note ? `\n📜 Notes:\n${htmlToPlainText(noteText || activity.note)}` : null, `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}` ].filter(Boolean).join('\n');
+  if (jobChannelId){ await ensureBotInChannel(jobChannelId); if (ENABLE_SLACK_PDF_UPLOAD){ try { await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); } catch(e){ console.warn('[WO] files.uploadV2 (job) failed:', e?.data || e?.message || e); } } }
+  if (assigneeChannelId){ await ensureBotInChannel(assigneeChannelId); if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); } if (ENABLE_SLACK_PDF_UPLOAD){ try { const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary }); const fids = []; if (up?.files && Array.isArray(up.files)) { for (const f of up.files) if (f?.id) fids.push(f.id); } else if (up?.file?.id) { fids.push(up.file.id); } const aMsgTs = up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts || up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts || null; ASSIGNEE_POSTS.set(String(activity.id), { assigneeChannelId, messageTs: aMsgTs, fileIds: fids }); } catch(e){ console.warn('[WO] files.uploadV2 (assignee) failed:', e?.data || e?.message || e); } } }
   if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
 }
 
@@ -555,27 +333,29 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
+    const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
+
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
       if (!data?.id) return res.status(200).send('No activity');
-
-      // 🚫 Absolutely ignore invoice-like activities
       if (isInvoiceLike(data)) { console.log('[PD Hook] skip activity id=%s (invoice-like)', data.id); return res.status(200).send('OK'); }
-
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
 
-      // Fetch full activity
+      // Reassignment detection (for ACTIVITY updates)
+      const oldTeamIdA = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
+      const newTeamIdA = data[PRODUCTION_TEAM_FIELD_KEY];
+      const oldCrewA = crewNameFrom(prev?.subject);
+      const newCrewA = crewNameFrom(data?.subject);
+      const teamChangedA = oldTeamIdA !== newTeamIdA && (oldTeamIdA !== undefined || newTeamIdA !== undefined);
+      const crewChangedA = (oldCrewA || newCrewA) && (oldCrewA !== newCrewA);
+
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
 
-      // Calm-down guards (idempotency + freshness)
       if (alreadyHandled(activity)) { console.log('[WO] duplicate burst for activity; skipping', activity.id); return res.status(200).send('OK'); }
       if (!isActivityFresh(activity)) { console.log('[WO] stale activity; skipping', activity.id); return res.status(200).send('OK'); }
-
-      // Re-check after fetch (in case subject changed)
       if (isInvoiceLike(activity)) { console.log('[PD Hook] skip activity id=%s (invoice-like after fetch)', activity.id); return res.status(200).send('OK'); }
-
       if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
       let deal = null;
@@ -587,82 +367,69 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+
+      if (action === 'update' && (teamChangedA || crewChangedA)) {
+        const assignee = detectAssignee({ deal, activity });
+        const oldChannel = (()=>{
+          if (oldTeamIdA && PRODUCTION_TEAM_TO_CHANNEL[oldTeamIdA]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamIdA];
+          if (oldCrewA) { const key = oldCrewA.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
+          return null;
+        })();
+
+        if (ENABLE_DELETE_ON_REASSIGN) {
+          if (oldChannel) await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
+          await deleteAssigneePost(activity.id);
+          const oldJobChannel = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
+          if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
+        }
+
+        console.log('[WO] activity reassignment detected → lightweight notice only (no job-channel repost)');
+        await postAssignmentNotice({ activity, deal, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName });
+        return res.status(200).send('OK');
+      }
+
+      // Otherwise (create, or non-reassignment update) keep existing behavior
       const assignee = detectAssignee({ deal, activity });
-
       console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
-
-      // For activity create/update we keep existing behavior (post full WO once per burst)
       await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
       return res.status(200).send('OK');
     }
 
     if (entity === 'deal' && action === 'update') {
-      const deal = data;
-      if (!deal?.id) return res.status(200).send('No deal');
-
-      const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
-      const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-      const crewNameFrom = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-      const oldCrewName = crewNameFrom(prev?.title);
-      const newCrewName = crewNameFrom(deal?.title);
-
-      const teamChanged = oldTeamId !== newTeamId;
-      const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
+      const deal = data; if (!deal?.id) return res.status(200).send('No deal');
+      const oldTeamId = prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined; const newTeamId = deal[PRODUCTION_TEAM_FIELD_KEY];
+      const oldCrewName = crewNameFrom(prev?.title); const newCrewName = crewNameFrom(deal?.title);
+      const teamChanged = oldTeamId !== newTeamId; const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
       console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
       if (!teamChanged && !crewChanged) return res.status(200).send('OK');
 
-      const assignee = detectAssignee({ deal, activity: null });
-      if (!assignee.channelId) { console.log('[PD Hook] no assignee channel resolved for deal update'); return res.status(200).send('OK'); }
-
-      let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+      const assignee = detectAssignee({ deal, activity: null }); if (!assignee.channelId) { console.log('[PD Hook] no assignee channel resolved for deal update'); return res.status(200).send('OK'); }
+      let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK }); if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
       const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
       const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => {
-        if (!a || a.done === true || a.done === 1) return false;
-        if (String(a.type || '').toLowerCase() === 'invoice') return false;
-        if (isInvoiceLike(a)) return false;
-        if (!isActivityFresh(a)) return false;
-        return true;
-      });
+      const items = (listJson?.data || []).filter(a => { if (!a || a.done === true || a.done === 1) return false; if (String(a.type || '').toLowerCase() === 'invoice') return false; if (isInvoiceLike(a)) return false; if (!isActivityFresh(a)) return false; return true; });
       console.log('[PD Hook] DEAL update → open activities to reroute: %d', items.length);
 
-      const oldChannel = (()=>{
-        if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId];
-        if (oldCrewName) { const key = oldCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
-        return null;
-      })();
+      const oldChannel = (()=>{ if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]; if (oldCrewName) { const key = oldCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; } return null; })();
 
       for (const activity of items) {
         try {
-          // On reassignment: delete old assignee posts + PDFs, DO NOT repost full WO → send lightweight notice only
           if (ENABLE_DELETE_ON_REASSIGN) {
             if (oldChannel) await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
             await deleteAssigneePost(activity.id);
             const oldJobChannel = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
-
-          // Calm-down guards in reroute loop
           if (alreadyHandled(activity)) { console.log('[WO] duplicate during deal reroute; skipping', activity.id); continue; }
           if (!isActivityFresh(activity)) { console.log('[WO] stale during deal reroute; skipping', activity.id); continue; }
-
-          // 🔔 Lightweight notice only
           await postAssignmentNotice({ activity, deal, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName });
-
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
-
       return res.status(200).send('OK');
     }
 
-    if (entity === 'activity' && (action === 'delete')) {
-      const id = data?.id || meta?.entity_id;
-      console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
-      if (id) await deleteAssigneePost(id);
-      return res.status(200).send('OK');
-    }
+    if (entity === 'activity' && (action === 'delete')) { const id = data?.id || meta?.entity_id; console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id); if (id) await deleteAssigneePost(id); return res.status(200).send('OK'); }
 
     console.log('[PD Hook] ignored event entity=%s action=%s', entity, action);
     return res.status(200).send('OK');
@@ -682,71 +449,23 @@ expressApp.get('/wo/complete', async (req, res) => {
     const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
-    // 1) Mark PD activity done
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
-    });
+    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso }) });
     const pdJson = await pdResp.json();
     const ok = !!(pdJson && pdJson.success);
 
-    // 2) Fetch activity + deal (for PDF fields)
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
-    try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const aJson = await aRes.json();
-      if (aJson?.success && aJson.data) {
-        activity = aJson.data;
-        const dealId = did || activity.deal_id;
-        if (dealId) {
-          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-          const dJson = await dRes.json();
-          if (dJson?.success && dJson.data) {
-            deal = dJson.data;
-            dealTitle = deal.title || 'N/A';
-            const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
-            typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-            location = deal.location || 'N/A';
-          }
-        }
-      }
-    } catch (e) { console.warn('[WO] fetch for completion PDF failed', e?.message||e); }
+    try { const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`); const aJson = await aRes.json(); if (aJson?.success && aJson.data) { activity = aJson.data; const dealId = did || activity.deal_id; if (dealId) { const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`); const dJson = await dRes.json(); if (dJson?.success && dJson.data) { deal = dJson.data; dealTitle = deal.title || 'N/A'; const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc']; typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A'; location = deal.location || 'N/A'; } } } } catch (e) { console.warn('[WO] fetch for completion PDF failed', e?.message||e); }
 
     const dealIdForUpload = did || activity?.deal_id;
 
-    // 3) Generate and upload a *Completed Work Order* PDF to PD and Slack
-    try {
-      const completedPdf = await buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt: Date.now() });
-      const up = await uploadPdfToPipedrive({ dealId: dealIdForUpload, pdfBuffer: completedPdf, filename: `WO_${aid}_Completed.pdf` });
-      console.log('[WO] completion PDF uploaded', up?.success);
-      const jobChannel = cid || DEFAULT_CHANNEL;
-      if (jobChannel) {
-        await uploadPdfToSlack({ channel: jobChannel, filename: `WO_${aid}_Completed.pdf`, pdfBuffer: completedPdf, title: 'Work Order Completed', initialComment: `✅ Completed Work Order for activity ${aid}. ${AID_TAG(aid)}` });
-      }
-    } catch (e) {
-      console.error('[WO] completion PDF upload failed', e?.message||e);
-    }
+    try { const completedPdf = await buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt: Date.now() }); await uploadPdfToPipedrive({ dealId: dealIdForUpload, pdfBuffer: completedPdf, filename: `WO_${aid}_Completed.pdf` }); const jobChannel = cid || DEFAULT_CHANNEL; if (jobChannel) { await uploadPdfToSlack({ channel: jobChannel, filename: `WO_${aid}_Completed.pdf`, pdfBuffer: completedPdf, title: 'Work Order Completed', initialComment: `✅ Completed Work Order for activity ${aid}. ${AID_TAG(aid)}` }); } } catch (e) { console.error('[WO] completion PDF upload failed', e?.message||e); }
 
-    // 3.5) Add a Pipedrive note announcing completion
-    try {
-      const when = new Date().toLocaleString();
-      const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await postPdNote({
-        dealId: dealIdForUpload,
-        content: `✅ Work Order Completed via QR Scan.\nActivity ${aid} ${subject} marked done at ${when}.\nA completion PDF has been attached to the deal.`
-      });
-    } catch(e) { console.error('[WO] PD completion note failed', e?.message||e); }
+    try { const when = new Date().toLocaleString(); const subject = activity?.subject ? `“${activity.subject}”` : ''; await postPdNote({ dealId: dealIdForUpload, content: `✅ Work Order Completed via QR Scan.\nActivity ${aid} ${subject} marked done at ${when}.\nA completion PDF has been attached to the deal.` }); } catch(e) { console.error('[WO] PD completion note failed', e?.message||e); }
 
-    // 4) Clean up assignee channel WO message/files
     await deleteAssigneePost(aid);
 
-    res.status(200).send(
-      `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
-       <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
-       ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
-       <p>${ok ? 'A completion PDF and note have been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
-    );
+    res.status(200).send(`<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2><p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>${did ? `<p>Deal: <b>${did}</b></p>` : ''}<p>${ok ? 'A completion PDF and note have been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`);
   } catch (err) {
     console.error('/wo/complete error:', err);
     res.status(500).send('Server error.');
@@ -755,48 +474,7 @@ expressApp.get('/wo/complete', async (req, res) => {
 
 /* ========= On-demand WO PDF ========= */
 expressApp.get('/wo/pdf', async (req,res)=>{
-  try{
-    const aid = req.query.aid;
-    if(!aid) return res.status(400).send('Missing aid');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-    const aj = await aRes.json();
-    if (!aj?.success || !aj.data) return res.status(404).send('Activity not found');
-    const data = aj.data;
-
-    // Hard stop for invoice-like activities (do not generate WOs)
-    if (isInvoiceLike(data)) return res.status(403).send('Forbidden for invoice activities');
-
-    let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
-    const dealId = data.deal_id;
-    if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const dj = await dRes.json();
-      if (dj?.success && dj.data){
-        deal = dj.data;
-        dealTitle = deal.title || 'N/A';
-        const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
-        typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-        location = deal.location || 'N/A';
-        const ass = detectAssignee({ deal, activity: data });
-        assigneeName = ass.teamName || assigneeName;
-        const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
-        if (pid) {
-          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-          const pjson = await pres.json();
-          if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
-        }
-      }
-    }
-
-    const channelIdForQr = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
-    const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
-    return res.send(pdfBuffer);
-  }catch(e){
-    console.error('/wo/pdf error', e);
-    res.status(500).send('error');
-  }
+  try{ const aid = req.query.aid; if(!aid) return res.status(400).send('Missing aid'); const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`); const aj = await aRes.json(); if (!aj?.success || !aj.data) return res.status(404).send('Activity not found'); const data = aj.data; if (isInvoiceLike(data)) return res.status(403).send('Forbidden for invoice activities'); let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null; const dealId = data.deal_id; if (dealId){ const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`); const dj = await dRes.json(); if (dj?.success && dj.data){ deal = dj.data; dealTitle = deal.title || 'N/A'; const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc']; typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A'; location = deal.location || 'N/A'; const ass = detectAssignee({ deal, activity: data }); assigneeName = ass.teamName || assigneeName; const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id; if (pid) { const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`); const pjson = await pres.json(); if (pjson?.success && pjson.data) customerName = pjson.data.name || null; } } } const channelIdForQr = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK }); const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id }); res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`); return res.send(pdfBuffer); }catch(e){ console.error('/wo/pdf error', e); res.status(500).send('error'); }
 });
 
 /* ========= Start ========= */
