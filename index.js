@@ -29,9 +29,6 @@ const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'fal
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 
 // Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
-//   - immediate: always post to the job channel
-//   - on_assigned (default): only post when a Production Team is set
-//   - on_complete: never post to job channel until QR completion
 const JOB_CHANNEL_MODE = (process.env.JOB_CHANNEL_MODE || 'on_assigned').toLowerCase();
 const JOB_CHANNEL_MODES = new Set(['immediate','on_assigned','on_complete']);
 function shouldPostToJobChannel({ assigneeChannelId }){
@@ -43,8 +40,6 @@ function shouldPostToJobChannel({ assigneeChannelId }){
 }
 
 // Job-channel content style: 'summary' | 'pdf'
-//   - summary (default): light notice only (no PDF/notes)
-//   - pdf: full PDF + notes to job channel
 const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
 // Optional: skip invoice/billing tasks entirely
@@ -53,6 +48,10 @@ const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,bille
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
+
+// ====== NEW: subject renaming controls ======
+const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
+const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps original subject and appends "— Crew: {name}"
 
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
@@ -235,6 +234,70 @@ function isInvoiceLike(activity){
   const re = new RegExp(`\\b(${escaped.join('|')})\\b`, 'i');
   if (re.test(subject) || re.test(note)) return true;
   return false;
+}
+
+/* ========= NEW: subject renaming utils ========= */
+function normalizeCrewTag(name){
+  if (!name) return null;
+  const clean = String(name).trim().replace(/\s+/g,' ');
+  return `Crew: ${clean}`;
+}
+
+function extractCrewTag(subject){
+  if (!subject) return null;
+  const m = String(subject).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
+  return m?.[0] || null; // full "Crew: Name"
+}
+
+function buildRenamedSubject(original, assigneeName){
+  const crewTag = normalizeCrewTag(assigneeName);
+  if (!crewTag) return original || '';
+  const subj = String(original || '').trim();
+  const existing = extractCrewTag(subj);
+  if (existing) {
+    // replace existing crew tag
+    return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
+  }
+  if (RENAME_FORMAT === 'append') {
+    return subj ? `${subj} — ${crewTag}` : crewTag;
+  }
+  // default fallback
+  return subj ? `${subj} — ${crewTag}` : crewTag;
+}
+
+function shouldRenameSubject({ activity, assigneeName }){
+  if (!assigneeName) return false;
+  if (!activity || activity.done) return false;
+  if (isInvoiceLike(activity)) return false; // NEVER rename invoice-like
+  if (RENAME_ON_ASSIGN === 'never') return false;
+
+  const subj = String(activity.subject || '');
+  const hasCrew = !!extractCrewTag(subj);
+
+  if (RENAME_ON_ASSIGN === 'when_missing') {
+    return !hasCrew;
+  }
+  if (RENAME_ON_ASSIGN === 'always') {
+    return true;
+  }
+  return false;
+}
+
+async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
+  try{
+    const newSubject = buildRenamedSubject(currentSubject, assigneeName);
+    if (newSubject && newSubject !== currentSubject){
+      const resp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ subject: newSubject })
+      });
+      const j = await resp.json();
+      if (!j?.success) console.warn('[WO] subject rename failed', j);
+      else console.log('[WO] subject renamed for activity %s', activityId);
+    }
+  }catch(e){
+    console.warn('[WO] subject rename error', activityId, e?.message||e);
+  }
 }
 
 /* ========= Channel resolution ========= */
@@ -565,6 +628,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
+      // ====== NEW: rename subject safely (never for invoice-like) ======
+      if (assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName })) {
+        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
+        // refresh the activity subject for subsequent posting (optional)
+        try {
+          const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const a2j = await a2.json();
+          if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
+        } catch {}
+      }
+
       console.log('[PD Hook] ACTIVITY %s → deal=%s assigneeChannel=%s assignee=%s', action, activity.deal_id || 'N/A', assignee.channelId || 'none', assignee.teamName || 'unknown');
 
       await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
@@ -611,6 +685,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             const oldJobChannel = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
+
+          // ====== NEW: rename subject safely on deal-level reassignment too ======
+          if (assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName })) {
+            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
+            try {
+              const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+              const a2j = await a2.json();
+              if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
+            } catch {}
+          }
+
           await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
         } catch (e) { console.error('[WO] re-route failed', activity?.id, e?.message||e); }
       }
@@ -653,7 +738,7 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
