@@ -63,9 +63,6 @@ function subjectMatchesList(subject, list){
   return list.some(s => normalizeForInvoice(s) === n);
 }
  
-// absolute “never rename” subjects from env
-  if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
-
 // ====== Subject renaming controls ======
 const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
 const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps original subject and appends "— Crew: {name}"
@@ -343,7 +340,7 @@ function shouldRenameSubject({ activity, assigneeName }){
   // type-based gating
   if (!isTypeAllowedForRename(activity)) return false;
 
-  const mode = (RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
+  const mode = (RENAME_ON_ASSIGN || 'when_missing').toLowerCase();
   if (mode === 'never') return false;
 
   const subj = String(activity.subject || '');
@@ -353,6 +350,7 @@ function shouldRenameSubject({ activity, assigneeName }){
 
   return false;
 }
+
 
 
 async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
