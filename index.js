@@ -323,17 +323,16 @@ function buildRenamedSubject(original, assigneeName){
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
+/**
+ * Gatekeeper: should we rename this activity's subject?
+ * NOTE: DO NOT paste any 'return' lines outside this function.
+ */
 function shouldRenameSubject({ activity, assigneeName }){
   if (!assigneeName) return false;
   if (!activity || activity.done) return false;
-  
+
   // absolute “never rename” subjects from env
   if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
-
-   
-  // absolute “never rename” subjects from env
-  if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
-
 
   // never rename the specific Billed/Invoice subject
   if (isBilledInvoiceSubject(activity.subject)) return false;
@@ -344,15 +343,17 @@ function shouldRenameSubject({ activity, assigneeName }){
   // type-based gating
   if (!isTypeAllowedForRename(activity)) return false;
 
-  const mode = (RENAME_ON_ASSIGN || 'when_missing').toLowerCase();
+  const mode = (RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
   if (mode === 'never') return false;
 
   const subj = String(activity.subject || '');
   const hasCrew = !!extractCrewTag(subj);
   if (mode === 'when_missing') return !hasCrew;
   if (mode === 'always') return true;
+
   return false;
 }
+
 
 async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
   try{
