@@ -48,6 +48,25 @@ const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,bille
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
+// ===== Subject lists (explicit, env-driven) =====
+function toSubjectListEnv(name){
+  return (process.env[name] || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');   // e.g. "Billed/Invoice,Final Invoice"
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');  // optional: subjects we never post/PDF
+
+function subjectMatchesList(subject, list){
+  const n = normalizeForInvoice(subject || '');
+  return list.some(s => normalizeForInvoice(s) === n);
+}
+if (!activity || activity.done) return false;
+ 
+// absolute “never rename” subjects from env
+  if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
+
 
 // ====== Subject renaming controls ======
 const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
@@ -309,6 +328,10 @@ function buildRenamedSubject(original, assigneeName){
 function shouldRenameSubject({ activity, assigneeName }){
   if (!assigneeName) return false;
   if (!activity || activity.done) return false;
+   
+  // absolute “never rename” subjects from env
+  if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
+
 
   // never rename the specific Billed/Invoice subject
   if (isBilledInvoiceSubject(activity.subject)) return false;
