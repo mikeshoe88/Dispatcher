@@ -48,6 +48,7 @@ const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,bille
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
+
 // ===== Subject lists (explicit, env-driven) =====
 function toSubjectListEnv(name){
   return (process.env[name] || '')
@@ -304,6 +305,13 @@ function extractCrewTag(subject){
   return m?.[0] || null; // full "Crew: Name"
 }
 
+// NEW helpers to compare crew names (so we can detect reassignment)
+function extractCrewName(subject){
+  const m = String(subject || '').match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
+  return m ? m[1].trim().toLowerCase() : null;
+}
+function normalizeName(s){ return String(s || '').trim().toLowerCase(); }
+
 function buildRenamedSubject(original, assigneeName){
   const crewTag = normalizeCrewTag(assigneeName);
   if (!crewTag) return original || '';
@@ -322,7 +330,7 @@ function buildRenamedSubject(original, assigneeName){
 
 /**
  * Gatekeeper: should we rename this activity's subject?
- * NOTE: DO NOT paste any 'return' lines outside this function.
+ * Now also renames if the existing Crew tag is for a different person.
  */
 function shouldRenameSubject({ activity, assigneeName }){
   if (!assigneeName) return false;
@@ -344,14 +352,15 @@ function shouldRenameSubject({ activity, assigneeName }){
   if (mode === 'never') return false;
 
   const subj = String(activity.subject || '');
-  const hasCrew = !!extractCrewTag(subj);
-  if (mode === 'when_missing') return !hasCrew;
+  const currentCrew = extractCrewName(subj);       // e.g., "anastacio"
+  const wantedCrew  = normalizeName(assigneeName); // e.g., "mike"
+
+  // rename if missing OR mismatched
+  if (mode === 'when_missing') return !currentCrew || currentCrew !== wantedCrew;
   if (mode === 'always') return true;
 
   return false;
 }
-
-
 
 async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
   try{
@@ -690,6 +699,24 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
+
+      // --- NEW: clean up previous assignee post if crew changed on ACTIVITY updates ---
+      try {
+        const prevTeamId  = (prev && prev[PRODUCTION_TEAM_FIELD_KEY]) ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
+        const prevCrewRaw = prev && prev.subject ? extractCrewName(prev.subject) : null;
+        const oldChannel =
+          (prevTeamId && PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]) ? PRODUCTION_TEAM_TO_CHANNEL[prevTeamId]
+          : (prevCrewRaw && NAME_TO_CHANNEL[prevCrewRaw.toLowerCase()]) ? NAME_TO_CHANNEL[prevCrewRaw.toLowerCase()]
+          : null;
+
+        if (ENABLE_DELETE_ON_REASSIGN && oldChannel && oldChannel !== assignee.channelId) {
+          await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
+          await deleteAssigneePost(activity.id); // will nuke any tracked old post
+        }
+      } catch (e) {
+        console.warn('[WO] cleanup-on-reassign (activity) failed:', e?.message || e);
+      }
+      // -------------------------------------------------------------------------------
 
       // Rename policy: special-case Billed/Invoice → log note only; else conditional rename
       if (isBilledInvoiceSubject(activity.subject)) {
