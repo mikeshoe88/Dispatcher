@@ -22,9 +22,6 @@ const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // debugging override
 
-// NEW: debug switch for rename logging
-const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
-
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
@@ -68,8 +65,13 @@ function subjectMatchesList(subject, list){
 }
  
 // ====== Subject renaming controls ======
-const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'when_missing').toLowerCase(); // 'never' | 'when_missing' | 'always'
+// Force aggressive renaming while we validate behavior. You can set RENAME_ON_ASSIGN in env to override.
+const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
 const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps original subject and appends "— Crew: {name}"
+
+// ===== Debug flags =====
+const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
+const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
 
 // ====== Type-based gating for renames ======
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
@@ -300,7 +302,7 @@ function isTypeAllowedForRename(activity){
   return true; // default allow
 }
 
-/* ========= NEW: subject renaming utils ========= */
+/* ========= Subject renaming utils ========= */
 function normalizeCrewTag(name){
   if (!name) return null;
   const clean = String(name).trim().replace(/\s+/g,' ');
@@ -313,7 +315,7 @@ function extractCrewTag(subject){
   return m?.[0] || null; // full "Crew: Name"
 }
 
-// NEW helpers to compare crew names (so we can detect reassignment)
+// Compare crew names (so we can detect reassignment)
 function extractCrewName(subject){
   const m = String(subject || '').match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
   return m ? m[1].trim().toLowerCase() : null;
@@ -338,7 +340,7 @@ function buildRenamedSubject(original, assigneeName){
 
 /**
  * Gatekeeper: should we rename this activity's subject?
- * Now also renames if the existing Crew tag is for a different person.
+ * Renames if the existing Crew tag is for a different person.
  */
 function shouldRenameSubject({ activity, assigneeName }){
   if (!assigneeName) return false;
@@ -370,23 +372,17 @@ function shouldRenameSubject({ activity, assigneeName }){
   return false;
 }
 
-// UPDATED: include activityType and detailed logging
-async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName, activityType){
+async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
   try{
     const newSubject = buildRenamedSubject(currentSubject, assigneeName);
-    if (DEBUG_RENAME) {
-      console.log('[RENAME] try id=%s current="%s" new="%s" assignee="%s" type="%s"',
-        activityId, currentSubject, newSubject, assigneeName, activityType || '');
-    }
     if (newSubject && newSubject !== currentSubject){
-      const body = { subject: newSubject };
-      if (activityType) body.type = activityType; // helps avoid rare PD validations
+      if (DEBUG_RENAME) console.log('[RENAME] PUT id=%s subj: "%s" -> "%s"', activityId, currentSubject, newSubject);
       const resp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
         method:'PUT', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(body)
+        body: JSON.stringify({ subject: newSubject })
       });
       const j = await resp.json();
-      if (DEBUG_RENAME) console.log('[RENAME] PD response', j);
+      if (DEBUG_RENAME) console.log('[RENAME] PD response id=%s success=%s subject="%s"', activityId, j?.success, j?.data?.subject);
       if (!j?.success) console.warn('[WO] subject rename failed', j);
       else console.log('[WO] subject renamed for activity %s', activityId);
     }
@@ -489,7 +485,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
   doc.on('data', c => chunks.push(c));
-  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));  
+  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
   doc.fontSize(20).text('Work Order', { align:'center' });
   doc.moveDown(0.25);
   doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' });
@@ -690,9 +686,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
       if (!isActivityFresh(data)) { console.log('[PD Hook] skip activity id=%s (stale)', data.id); return res.status(200).send('OK'); }
-      if (alreadyHandledEvent(meta, data)) { 
-        console.log('[PD Hook] skip activity id=%s (dedup via meta)', data.id); 
-        return res.status(200).send('OK'); 
+      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
+        if (DEBUG_RENAME) console.log('[RENAME] dedup hit for activity %s (meta ts=%s)', data?.id, meta?.timestamp);
+        return res.status(200).send('OK');
       }
 
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -702,6 +698,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // Log for learning the exact keys of your custom types
       console.log('[PD Hook] activity id=%s type=%s subject=%s', activity.id, activity.type, activity.subject);
+      if (DEBUG_RENAME) {
+        console.log('[RENAME] activity hook: id=%s type=%s subj="%s" currentCrew=%s',
+          activity.id, (activity?.type || 'n/a'), activity?.subject, extractCrewName(activity?.subject));
+      }
 
       if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
@@ -719,6 +719,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
+      if (DEBUG_RENAME) {
+        console.log('[RENAME] assignee resolved for id=%s -> %j', activity.id, assignee);
+      }
+
       // --- cleanup previous assignee post if crew changed on ACTIVITY updates ---
       try {
         const prevTeamId  = (prev && prev[PRODUCTION_TEAM_FIELD_KEY]) ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
@@ -730,30 +734,28 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
         if (ENABLE_DELETE_ON_REASSIGN && oldChannel && oldChannel !== assignee.channelId) {
           await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
-          await deleteAssigneePost(activity.id);
+          await deleteAssigneePost(activity.id); // will nuke any tracked old post
         }
       } catch (e) {
         console.warn('[WO] cleanup-on-reassign (activity) failed:', e?.message || e);
       }
-      // -------------------------------------------------------------------------
-
-      // Decision log and rename
-      const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
-      if (DEBUG_RENAME) {
-        console.log('[RENAME] decision id=%s type=%s subj="%s" currentCrew=%s wantedCrew=%s -> %s',
-          activity.id,
-          activity.type,
-          activity.subject,
-          extractCrewName(activity.subject),
-          (assignee.teamName || '').toLowerCase(),
-          willRename ? 'RENAME' : 'SKIP');
-      }
 
       // Rename policy: special-case Billed/Invoice → log note only; else conditional rename
+      const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
+      if (DEBUG_RENAME) {
+        console.log('[RENAME] decision id=%s wanted=%s current=%s mode=%s -> %s',
+          activity.id,
+          (assignee.teamName || '').toLowerCase(),
+          extractCrewName(activity.subject),
+          RENAME_ON_ASSIGN,
+          willRename ? 'RENAME' : 'SKIP'
+        );
+      }
+
       if (isBilledInvoiceSubject(activity.subject)) {
         if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-      } else if (assignee.teamName && willRename) {
-        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName, activity.type);
+      } else if (willRename) {
+        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
         // refresh activity subject for subsequent posting (optional)
         try {
           const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -809,22 +811,22 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
 
+          // Rename policy for each open activity
           const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
           if (DEBUG_RENAME) {
-            console.log('[RENAME] decision(id=%s from deal update) type=%s subj="%s" currentCrew=%s wantedCrew=%s -> %s',
+            console.log('[RENAME] (deal loop) id=%s wanted=%s current=%s mode=%s -> %s',
               activity.id,
-              activity.type,
-              activity.subject,
-              extractCrewName(activity.subject),
               (assignee.teamName || '').toLowerCase(),
-              willRename ? 'RENAME' : 'SKIP');
+              extractCrewName(activity.subject),
+              RENAME_ON_ASSIGN,
+              willRename ? 'RENAME' : 'SKIP'
+            );
           }
 
-          // Rename policy for each open activity
           if (isBilledInvoiceSubject(activity.subject)) {
             if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-          } else if (assignee.teamName && willRename) {
-            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName, activity.type);
+          } else if (willRename) {
+            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
             try {
               const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
               const a2j = await a2.json();
@@ -874,7 +876,7 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
