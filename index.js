@@ -21,8 +21,6 @@ const BASE_URL = process.env.BASE_URL;
 const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // debugging override
-const PREFER_DEAL_ASSIGNEE = (process.env.PREFER_DEAL_ASSIGNEE || 'true') !== 'false';
-
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
@@ -47,16 +45,12 @@ const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCa
 // Optional: skip invoice/billing tasks entirely (for posting/processing). Renaming uses narrower rule below too.
 const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false'; // default true
 const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice,ar follow up,accounts receivable')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 // ===== Subject lists (explicit, env-driven) =====
 function toSubjectListEnv(name){
   return (process.env[name] || '')
-    .split(',')
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');   // e.g. "Billed/Invoice,Final Invoice"
 const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');  // optional: subjects we never post/PDF
@@ -65,46 +59,15 @@ function subjectMatchesList(subject, list){
   const n = normalizeForInvoice(subject || '');
   return list.some(s => normalizeForInvoice(s) === n);
 }
- 
+
 // ====== Subject renaming controls ======
 // Force aggressive renaming while we validate behavior. You can set RENAME_ON_ASSIGN in env to override.
 const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
-const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps original subject and appends "— Crew: {name}"
+const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append';
 
 // ===== Debug flags =====
 const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
-
-// Ensures the subject ends with the correct "Crew: {Name}" tag.
-// Renames only if the subject actually needs to change.
-async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
-  const want = (assigneeName || '').trim();
-  if (!activityId || !want) return { did:false, reason:'no-assignee' };
-
-  const haveCrew = extractCrewName(currentSubject);   // e.g. "anastacio"
-  const wantCrew = normalizeName(want);               // e.g. "mike"
-
-  if (haveCrew === wantCrew) {
-    console.log(`[RENAME] id=${activityId} already correct: crew=${wantCrew}`);
-    return { did:false, reason:'already-correct' };
-  }
-
-  const newSubject = buildRenamedSubject(currentSubject || '', want);
-  if (!newSubject || newSubject === currentSubject) {
-    console.log(`[RENAME] id=${activityId} computed no-op subject`);
-    return { did:false, reason:'no-op' };
-  }
-
-  console.log(`[RENAME] PUT id=${activityId} subj: "${currentSubject}" -> "${newSubject}"`);
-  const resp = await fetch(
-    `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`,
-    { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
-  );
-  const j = await resp.json();
-  console.log(`[RENAME] PD response id=${activityId} success=${!!j?.success} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
-  return { did: !!j?.success };
-}
-
 
 // ====== Type-based gating for renames ======
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
@@ -125,7 +88,7 @@ if (!PD_WEBHOOK_KEY) console.warn('⚠️ PD_WEBHOOK_KEY not set; /pipedrive-tas
 process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection:', r?.stack||r));
 process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
 
-/* ========= Anti-spam / dedupe ========= */
+/* ========= Anti-spam guards / Dedup ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
 
 // collapse duplicate PD webhook loops using meta.timestamp (or update_time fallback)
@@ -289,11 +252,7 @@ function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if
 
 // ===== Invoice detection (robust) =====
 function normalizeForInvoice(s=''){
-  return String(s)
-    .toLowerCase()
-    .replace(/\s*\/\s*/g, '/')    // “billed / invoice” → “billed/invoice”
-    .replace(/\s+/g, ' ')           // collapse whitespace
-    .trim();
+  return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
 }
 
 function isInvoiceLike(activity){
@@ -302,16 +261,12 @@ function isInvoiceLike(activity){
   const subjectNorm = normalizeForInvoice(activity?.subject || '');
   const noteNorm    = normalizeForInvoice(htmlToPlainText(activity?.note || ''));
 
-  // Exact (after normalization)
   const EXACTS = (process.env.INVOICE_EXACT_SUBJECTS || 'billed/invoice,invoice,invoice task,collect payment,final invoice,bill in 5 days')
-    .split(',')
-    .map(s => normalizeForInvoice(s))
-    .filter(Boolean);
+    .split(',').map(s => normalizeForInvoice(s)).filter(Boolean);
 
   if (EXACTS.includes(subjectNorm)) return true;
   if (subjectNorm.startsWith('invoice:') || subjectNorm.startsWith('invoice -') || subjectNorm.startsWith('billed/')) return true;
 
-  // Robust keyword block
   const escaped = INVOICE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   const re = new RegExp(`(?:^|\\b)(${escaped.join('|')})(?:\\b|$)`, 'i');
   return re.test(subjectNorm) || re.test(noteNorm);
@@ -329,10 +284,10 @@ function getActivityTypeKey(a){
 }
 function isTypeAllowedForRename(activity){
   const t = getActivityTypeKey(activity);
-  if (!t) return true; // if PD didn’t send a type, don’t block
+  if (!t) return true;
   if (RENAME_TYPES_ALLOW.length) return RENAME_TYPES_ALLOW.includes(t);
   if (RENAME_TYPES_BLOCK.length) return !RENAME_TYPES_BLOCK.includes(t);
-  return true; // default allow
+  return true;
 }
 
 /* ========= Subject renaming utils ========= */
@@ -341,14 +296,11 @@ function normalizeCrewTag(name){
   const clean = String(name).trim().replace(/\s+/g,' ');
   return `Crew: ${clean}`;
 }
-
 function extractCrewTag(subject){
   if (!subject) return null;
   const m = String(subject).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
-  return m?.[0] || null; // full "Crew: Name"
+  return m?.[0] || null;
 }
-
-// Compare crew names (so we can detect reassignment)
 function extractCrewName(subject){
   const m = String(subject || '').match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
   return m ? m[1].trim().toLowerCase() : null;
@@ -360,83 +312,43 @@ function buildRenamedSubject(original, assigneeName){
   if (!crewTag) return original || '';
   const subj = String(original || '').trim();
   const existing = extractCrewTag(subj);
-  if (existing) {
-    // replace existing crew tag
-    return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
-  }
-  if (RENAME_FORMAT === 'append') {
-    return subj ? `${subj} — ${crewTag}` : crewTag;
-  }
-  // default fallback
+  if (existing) return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
+  if (RENAME_FORMAT === 'append') return subj ? `${subj} — ${crewTag}` : crewTag;
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
-/**
- * Gatekeeper: should we rename this activity's subject?
- * Renames if the existing Crew tag is for a different person.
- */
-function shouldRenameSubject({ activity, assigneeName }){
-  if (!assigneeName) return false;
-  if (!activity || activity.done) return false;
+// Ensures the subject ends with the correct "Crew: {Name}" tag.
+// Only performs PUT when the subject actually needs a change.
+async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
+  const want = (assigneeName || '').trim();
+  if (!activityId || !want) return { did:false, reason:'no-assignee' };
 
-  // absolute “never rename” subjects from env
-  if (subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) return false;
+  const haveCrew = extractCrewName(currentSubject);   // e.g. "anastacio"
+  const wantCrew = normalizeName(want);               // e.g. "mike"
 
-  // never rename the specific Billed/Invoice subject
-  if (isBilledInvoiceSubject(activity.subject)) return false;
-
-  // general invoice-like safety net
-  if (isInvoiceLike(activity)) return false;
-
-  // type-based gating
-  if (!isTypeAllowedForRename(activity)) return false;
-
-  const mode = (RENAME_ON_ASSIGN || 'when_missing').toLowerCase();
-  if (mode === 'never') return false;
-
-  const subj = String(activity.subject || '');
-  const currentCrew = extractCrewName(subj);       // e.g., "anastacio"
-  const wantedCrew  = normalizeName(assigneeName); // e.g., "mike"
-
-  // rename if missing OR mismatched
-  if (mode === 'when_missing') return !currentCrew || currentCrew !== wantedCrew;
-  if (mode === 'always') return true;
-
-  return false;
-}
-
-async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
-  try{
-    const newSubject = buildRenamedSubject(currentSubject, assigneeName);
-    if (newSubject && newSubject !== currentSubject){
-      if (DEBUG_RENAME) console.log('[RENAME] PUT id=%s subj: "%s" -> "%s"', activityId, currentSubject, newSubject);
-      const resp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
-        method:'PUT', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ subject: newSubject })
-      });
-      const j = await resp.json();
-      if (DEBUG_RENAME) console.log('[RENAME] PD response id=%s success=%s subject="%s"', activityId, j?.success, j?.data?.subject);
-      if (!j?.success) console.warn('[WO] subject rename failed', j);
-      else console.log('[WO] subject renamed for activity %s', activityId);
-    }
-  }catch(e){
-    console.warn('[WO] subject rename error', activityId, e?.message||e);
+  if (DEBUG_RENAME) {
+    console.log(`[RENAME] id=${activityId} current=${JSON.stringify(currentSubject)} have=${haveCrew} want=${wantCrew}`);
   }
-}
 
-// Append a small activity note so we keep history without touching subject (used for Billed/Invoice)
-async function logCrewHistoryNote(activityId, assigneeName){
-  if (!activityId || !assigneeName) return;
-  try {
-    const content = `🧾 Crew assignment update (no subject change): ${assigneeName}\n⏱ ${new Date().toLocaleString()}`;
-    await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`, {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ content, pinned_to_activity_id: String(activityId) })
-    });
-  } catch (e) {
-    console.warn('[WO] logCrewHistoryNote failed', activityId, e?.message||e);
+  if (haveCrew === wantCrew) {
+    if (DEBUG_RENAME) console.log(`[RENAME] id=${activityId} already correct`);
+    return { did:false, reason:'already-correct' };
   }
+
+  const newSubject = buildRenamedSubject(currentSubject || '', want);
+  if (!newSubject || newSubject === currentSubject) {
+    if (DEBUG_RENAME) console.log(`[RENAME] id=${activityId} computed no-op`);
+    return { did:false, reason:'no-op' };
+  }
+
+  console.log(`[RENAME] PUT id=${activityId} subj: "${currentSubject}" -> "${newSubject}"`);
+  const resp = await fetch(
+    `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`,
+    { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
+  );
+  const j = await resp.json();
+  console.log(`[RENAME] PD response id=${activityId} success=${!!j?.success} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
+  return { did: !!j?.success };
 }
 
 /* ========= Channel resolution ========= */
@@ -471,7 +383,9 @@ async function findDealChannelId(dealId){
 async function ensureBotInChannel(channelId){
   if (!channelId) return;
   try{ await app.client.conversations.join({ channel: channelId }); }
-  catch{ /* already_in_channel etc. */ }
+  catch(e){
+    if (DEBUG_RENAME) console.warn('[WARN] bolt-app', e?.data?.error || e?.message || e, e?.data?.needed || '');
+  }
 }
 
 async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }){
@@ -481,46 +395,30 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 }
 
 /* ========= Assignee detection ========= */
-function detectAssignee({ deal, activity }) {
-  // Try both sources
-  const aTid = activity ? activity[PRODUCTION_TEAM_FIELD_KEY] : null;
-  const dTid = deal ? deal[PRODUCTION_TEAM_FIELD_KEY] : null;
-
-  // Helper to convert a teamId → {teamId, teamName, channelId}
-  const fromTeamId = (teamId) => {
-    if (!teamId) return null;
-    const channelId = PRODUCTION_TEAM_TO_CHANNEL[teamId];
-    if (!channelId) return null;
-    return {
-      teamId,
-      teamName: PRODUCTION_TEAM_MAP[teamId] || `Team ${teamId}`,
-      channelId
-    };
-  };
-
-  // Choose order based on toggle (default: deal first)
-  let picked =
-    (PREFER_DEAL_ASSIGNEE && fromTeamId(dTid)) ||
-    fromTeamId(aTid) ||
-    (!PREFER_DEAL_ASSIGNEE && fromTeamId(dTid)) ||
-    null;
-
-  if (picked) return picked;
-
-  // Fallback: parse "Crew: Name" from deal title or activity subject
+function detectAssignee({ deal, activity }){
+  if (activity) {
+    const aTid = activity[PRODUCTION_TEAM_FIELD_KEY];
+    if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) {
+      return { teamId: String(aTid), teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
+    }
+  }
+  if (deal) {
+    const dTid = deal[PRODUCTION_TEAM_FIELD_KEY];
+    if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) {
+      return { teamId: String(dTid), teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
+    }
+  }
   const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
-  if (name) {
+  if (name){
     const key = name.toLowerCase();
     const channelId = NAME_TO_CHANNEL[key] || null;
     const teamId = NAME_TO_TEAM_ID[key] || null;
-    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase() + name.slice(1));
-    if (channelId) return { teamId, teamName, channelId };
+    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
+    if (channelId) return { teamId: teamId ? String(teamId) : null, teamName, channelId };
   }
-
-  return { teamId: null, teamName: null, channelId: null };
+  return { teamId:null, teamName:null, channelId:null };
 }
-
 
 /* ========= Reassignment & completion tracking ========= */
 const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
@@ -736,7 +634,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
       if (!isActivityFresh(data)) { console.log('[PD Hook] skip activity id=%s (stale)', data.id); return res.status(200).send('OK'); }
       if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
-        if (DEBUG_RENAME) console.log('[RENAME] dedup hit for activity %s (meta ts=%s)', data?.id, meta?.timestamp);
+        console.log('[PD Hook] skip activity id=%s (dedup via meta)', data.id);
         return res.status(200).send('OK');
       }
 
@@ -747,10 +645,6 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // Log for learning the exact keys of your custom types
       console.log('[PD Hook] activity id=%s type=%s subject=%s', activity.id, activity.type, activity.subject);
-      if (DEBUG_RENAME) {
-        console.log('[RENAME] activity hook: id=%s type=%s subj="%s" currentCrew=%s',
-          activity.id, (activity?.type || 'n/a'), activity?.subject, extractCrewName(activity?.subject));
-      }
 
       if (activity.done === true || activity.done === 1) { console.log('[PD Hook] skip activity id=%s (done after fetch)', activity.id); return res.status(200).send('OK'); }
 
@@ -767,12 +661,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
+      console.log(`[ASSIGNEE] id=${activity.id} type=${activity.type} subject=${JSON.stringify(activity.subject)} -> ${JSON.stringify(assignee)}`);
 
-      if (DEBUG_RENAME) {
-        console.log('[RENAME] assignee resolved for id=%s -> %j', activity.id, assignee);
-      }
-
-      // --- cleanup previous assignee post if crew changed on ACTIVITY updates ---
+      // Clean up previous assignee post if crew changed on ACTIVITY updates
       try {
         const prevTeamId  = (prev && prev[PRODUCTION_TEAM_FIELD_KEY]) ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
         const prevCrewRaw = prev && prev.subject ? extractCrewName(prev.subject) : null;
@@ -783,29 +674,18 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
         if (ENABLE_DELETE_ON_REASSIGN && oldChannel && oldChannel !== assignee.channelId) {
           await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
-          await deleteAssigneePost(activity.id); // will nuke any tracked old post
+          await deleteAssigneePost(activity.id);
         }
       } catch (e) {
         console.warn('[WO] cleanup-on-reassign (activity) failed:', e?.message || e);
       }
 
-      // Rename policy: special-case Billed/Invoice → log note only; else conditional rename
-      const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
-      if (DEBUG_RENAME) {
-        console.log('[RENAME] decision id=%s wanted=%s current=%s mode=%s -> %s',
-          activity.id,
-          (assignee.teamName || '').toLowerCase(),
-          extractCrewName(activity.subject),
-          RENAME_ON_ASSIGN,
-          willRename ? 'RENAME' : 'SKIP'
-        );
-      }
-
+      // Always enforce crew tag on ACTIVITY events (except Billed/Invoice)
       if (isBilledInvoiceSubject(activity.subject)) {
         if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-      } else if (willRename) {
-        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
-        // refresh activity subject for subsequent posting (optional)
+      } else if (assignee.teamName && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
+        await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        // refresh subject for subsequent posting (optional)
         try {
           const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
           const a2j = await a2.json();
@@ -860,22 +740,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
 
-          // Rename policy for each open activity
-          const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
-          if (DEBUG_RENAME) {
-            console.log('[RENAME] (deal loop) id=%s wanted=%s current=%s mode=%s -> %s',
-              activity.id,
-              (assignee.teamName || '').toLowerCase(),
-              extractCrewName(activity.subject),
-              RENAME_ON_ASSIGN,
-              willRename ? 'RENAME' : 'SKIP'
-            );
-          }
-
+          // Always enforce crew tag on DEAL change (except Billed/Invoice)
           if (isBilledInvoiceSubject(activity.subject)) {
             if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-          } else if (willRename) {
-            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
+          } else if (assignee.teamName && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
+            await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
             try {
               const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
               const a2j = await a2.json();
@@ -925,7 +794,7 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
