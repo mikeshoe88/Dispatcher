@@ -680,7 +680,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
       if (!isActivityFresh(data)) { console.log('[PD Hook] skip activity id=%s (stale)', data.id); return res.status(200).send('OK'); }
-      if (alreadyHandled(data)) { console.log('[PD Hook] skip activity id=%s (dedup cache)', data.id); return res.status(200).send('OK'); }
+       if (alreadyHandledEvent(meta, data)) { 
+    console.log('[PD Hook] skip activity id=%s (dedup via meta)', data.id); 
+    return res.status(200).send('OK'); 
+  }
+
 
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
