@@ -21,6 +21,8 @@ const BASE_URL = process.env.BASE_URL;
 const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // debugging override
+const PREFER_DEAL_ASSIGNEE = (process.env.PREFER_DEAL_ASSIGNEE || 'true') !== 'false';
+
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
@@ -448,30 +450,46 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 }
 
 /* ========= Assignee detection ========= */
-function detectAssignee({ deal, activity }){
-  if (activity) {
-    const aTid = activity[PRODUCTION_TEAM_FIELD_KEY];
-    if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) {
-      return { teamId: aTid, teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
-    }
-  }
-  if (deal) {
-    const dTid = deal[PRODUCTION_TEAM_FIELD_KEY];
-    if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) {
-      return { teamId: dTid, teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
-    }
-  }
+function detectAssignee({ deal, activity }) {
+  // Try both sources
+  const aTid = activity ? activity[PRODUCTION_TEAM_FIELD_KEY] : null;
+  const dTid = deal ? deal[PRODUCTION_TEAM_FIELD_KEY] : null;
+
+  // Helper to convert a teamId → {teamId, teamName, channelId}
+  const fromTeamId = (teamId) => {
+    if (!teamId) return null;
+    const channelId = PRODUCTION_TEAM_TO_CHANNEL[teamId];
+    if (!channelId) return null;
+    return {
+      teamId,
+      teamName: PRODUCTION_TEAM_MAP[teamId] || `Team ${teamId}`,
+      channelId
+    };
+  };
+
+  // Choose order based on toggle (default: deal first)
+  let picked =
+    (PREFER_DEAL_ASSIGNEE && fromTeamId(dTid)) ||
+    fromTeamId(aTid) ||
+    (!PREFER_DEAL_ASSIGNEE && fromTeamId(dTid)) ||
+    null;
+
+  if (picked) return picked;
+
+  // Fallback: parse "Crew: Name" from deal title or activity subject
   const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
-  if (name){
+  if (name) {
     const key = name.toLowerCase();
     const channelId = NAME_TO_CHANNEL[key] || null;
     const teamId = NAME_TO_TEAM_ID[key] || null;
-    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
+    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase() + name.slice(1));
     if (channelId) return { teamId, teamName, channelId };
   }
-  return { teamId:null, teamName:null, channelId:null };
+
+  return { teamId: null, teamName: null, channelId: null };
 }
+
 
 /* ========= Reassignment & completion tracking ========= */
 const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
