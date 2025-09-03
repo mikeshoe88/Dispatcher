@@ -89,19 +89,24 @@ process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:'
 
 /* ========= Anti-spam guards (small + safe) ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
-const POSTED_CACHE = new Map();
-const POST_CACHE_TTL_MS = 5 * 60 * 1000;
 
-function alreadyHandled(activity){
-  const version = String(activity.update_time || activity.add_time || '');
-  const key = `aid:${activity.id}|v:${version}`;
+// collapse duplicate PD webhook loops using meta.timestamp (or update_time fallback)
+const EVENT_CACHE = new Map();
+const EVENT_CACHE_TTL_MS = 60 * 1000; // 60s
+
+function alreadyHandledEvent(meta, activity){
+  const id  = activity?.id || meta?.id || 'n/a';
+  const ver = meta?.timestamp || meta?.time || activity?.update_time || activity?.add_time || Date.now();
+  const key = `aid:${id}|v:${ver}`;
   const now = Date.now();
-  const exp = POSTED_CACHE.get(key);
+
+  const exp = EVENT_CACHE.get(key);
   if (exp && exp > now) return true;
-  if (POSTED_CACHE.size > 500){
-    for (const [k, t] of POSTED_CACHE){ if (t <= now) POSTED_CACHE.delete(k); }
+
+  if (EVENT_CACHE.size > 1000){
+    for (const [k, t] of EVENT_CACHE){ if (t <= now) EVENT_CACHE.delete(k); }
   }
-  POSTED_CACHE.set(key, now + POST_CACHE_TTL_MS);
+  EVENT_CACHE.set(key, now + EVENT_CACHE_TTL_MS);
   return false;
 }
 
@@ -122,6 +127,7 @@ function isDealActive(deal){
   if (deal.active_flag === false) return false;
   return true;
 }
+
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
