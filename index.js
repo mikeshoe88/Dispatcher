@@ -22,6 +22,9 @@ const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // debugging override
 
+// NEW: debug switch for rename logging
+const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
+
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
@@ -87,7 +90,7 @@ if (!PD_WEBHOOK_KEY) console.warn('⚠️ PD_WEBHOOK_KEY not set; /pipedrive-tas
 process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection:', r?.stack||r));
 process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
 
-/* ========= Anti-spam guards (small + safe) ========= */
+/* ========= Anti-spam / dedupe ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
 
 // collapse duplicate PD webhook loops using meta.timestamp (or update_time fallback)
@@ -127,7 +130,6 @@ function isDealActive(deal){
   if (deal.active_flag === false) return false;
   return true;
 }
-
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
@@ -368,15 +370,23 @@ function shouldRenameSubject({ activity, assigneeName }){
   return false;
 }
 
-async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName){
+// UPDATED: include activityType and detailed logging
+async function maybeRenameActivitySubject(activityId, currentSubject, assigneeName, activityType){
   try{
     const newSubject = buildRenamedSubject(currentSubject, assigneeName);
+    if (DEBUG_RENAME) {
+      console.log('[RENAME] try id=%s current="%s" new="%s" assignee="%s" type="%s"',
+        activityId, currentSubject, newSubject, assigneeName, activityType || '');
+    }
     if (newSubject && newSubject !== currentSubject){
+      const body = { subject: newSubject };
+      if (activityType) body.type = activityType; // helps avoid rare PD validations
       const resp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
         method:'PUT', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ subject: newSubject })
+        body: JSON.stringify(body)
       });
       const j = await resp.json();
+      if (DEBUG_RENAME) console.log('[RENAME] PD response', j);
       if (!j?.success) console.warn('[WO] subject rename failed', j);
       else console.log('[WO] subject renamed for activity %s', activityId);
     }
@@ -479,7 +489,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
   doc.on('data', c => chunks.push(c));
-  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
+  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));  
   doc.fontSize(20).text('Work Order', { align:'center' });
   doc.moveDown(0.25);
   doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' });
@@ -680,11 +690,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (data.done === true || data.done === 1) { console.log('[PD Hook] skip activity id=%s (already done)', data.id); return res.status(200).send('OK'); }
       if (!isActivityFresh(data)) { console.log('[PD Hook] skip activity id=%s (stale)', data.id); return res.status(200).send('OK'); }
-       if (alreadyHandledEvent(meta, data)) { 
-    console.log('[PD Hook] skip activity id=%s (dedup via meta)', data.id); 
-    return res.status(200).send('OK'); 
-  }
-
+      if (alreadyHandledEvent(meta, data)) { 
+        console.log('[PD Hook] skip activity id=%s (dedup via meta)', data.id); 
+        return res.status(200).send('OK'); 
+      }
 
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
@@ -710,7 +719,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
-      // --- NEW: clean up previous assignee post if crew changed on ACTIVITY updates ---
+      // --- cleanup previous assignee post if crew changed on ACTIVITY updates ---
       try {
         const prevTeamId  = (prev && prev[PRODUCTION_TEAM_FIELD_KEY]) ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined;
         const prevCrewRaw = prev && prev.subject ? extractCrewName(prev.subject) : null;
@@ -721,18 +730,30 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
         if (ENABLE_DELETE_ON_REASSIGN && oldChannel && oldChannel !== assignee.channelId) {
           await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
-          await deleteAssigneePost(activity.id); // will nuke any tracked old post
+          await deleteAssigneePost(activity.id);
         }
       } catch (e) {
         console.warn('[WO] cleanup-on-reassign (activity) failed:', e?.message || e);
       }
-      // -------------------------------------------------------------------------------
+      // -------------------------------------------------------------------------
+
+      // Decision log and rename
+      const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
+      if (DEBUG_RENAME) {
+        console.log('[RENAME] decision id=%s type=%s subj="%s" currentCrew=%s wantedCrew=%s -> %s',
+          activity.id,
+          activity.type,
+          activity.subject,
+          extractCrewName(activity.subject),
+          (assignee.teamName || '').toLowerCase(),
+          willRename ? 'RENAME' : 'SKIP');
+      }
 
       // Rename policy: special-case Billed/Invoice → log note only; else conditional rename
       if (isBilledInvoiceSubject(activity.subject)) {
         if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-      } else if (assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName })) {
-        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
+      } else if (assignee.teamName && willRename) {
+        await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName, activity.type);
         // refresh activity subject for subsequent posting (optional)
         try {
           const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -788,11 +809,22 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
           }
 
+          const willRename = assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName });
+          if (DEBUG_RENAME) {
+            console.log('[RENAME] decision(id=%s from deal update) type=%s subj="%s" currentCrew=%s wantedCrew=%s -> %s',
+              activity.id,
+              activity.type,
+              activity.subject,
+              extractCrewName(activity.subject),
+              (assignee.teamName || '').toLowerCase(),
+              willRename ? 'RENAME' : 'SKIP');
+          }
+
           // Rename policy for each open activity
           if (isBilledInvoiceSubject(activity.subject)) {
             if (assignee.teamName) await logCrewHistoryNote(activity.id, assignee.teamName);
-          } else if (assignee.teamName && shouldRenameSubject({ activity, assigneeName: assignee.teamName })) {
-            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName);
+          } else if (assignee.teamName && willRename) {
+            await maybeRenameActivitySubject(activity.id, activity.subject || '', assignee.teamName, activity.type);
             try {
               const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
               const a2j = await a2.json();
@@ -842,7 +874,7 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
