@@ -75,6 +75,37 @@ const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps o
 const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
 
+// Ensures the subject ends with the correct "Crew: {Name}" tag.
+// Renames only if the subject actually needs to change.
+async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
+  const want = (assigneeName || '').trim();
+  if (!activityId || !want) return { did:false, reason:'no-assignee' };
+
+  const haveCrew = extractCrewName(currentSubject);   // e.g. "anastacio"
+  const wantCrew = normalizeName(want);               // e.g. "mike"
+
+  if (haveCrew === wantCrew) {
+    console.log(`[RENAME] id=${activityId} already correct: crew=${wantCrew}`);
+    return { did:false, reason:'already-correct' };
+  }
+
+  const newSubject = buildRenamedSubject(currentSubject || '', want);
+  if (!newSubject || newSubject === currentSubject) {
+    console.log(`[RENAME] id=${activityId} computed no-op subject`);
+    return { did:false, reason:'no-op' };
+  }
+
+  console.log(`[RENAME] PUT id=${activityId} subj: "${currentSubject}" -> "${newSubject}"`);
+  const resp = await fetch(
+    `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`,
+    { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
+  );
+  const j = await resp.json();
+  console.log(`[RENAME] PD response id=${activityId} success=${!!j?.success} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
+  return { did: !!j?.success };
+}
+
+
 // ====== Type-based gating for renames ======
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
