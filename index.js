@@ -647,48 +647,95 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // ===== Deal update (re-assign all open activities) =====
-    if (entity === 'deal' && action === 'update') {
-      const deal = data;
-      if (!deal?.id) return res.status(200).send('No deal');
+  // ===== Deal update (re-assign/rename all open activities, even if webhook diff is vague) =====
+if (entity === 'deal' && action === 'update') {
+  const dealId = data?.id;
+  if (!dealId) return res.status(200).send('No deal');
 
-      const getCrew = (s)=> (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-      const oldTeamId = readEnumId(prev ? prev[PRODUCTION_TEAM_FIELD_KEY] : undefined);
-      const newTeamId = readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]);
-      const oldCrewName = getCrew(prev?.title);
-      const newCrewName = getCrew(deal?.title);
+  // 1) Always fetch the full, current deal so we see custom fields (webhook diffs often omit them)
+  let deal = null;
+  try {
+    const dRes = await fetch(
+      `https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`
+    );
+    const dJson = await dRes.json();
+    if (dJson?.success && dJson.data) deal = dJson.data;
+  } catch (e) {
+    console.warn('[PD Hook] DEAL fetch failed; falling back to webhook "data"', e?.message || e);
+  }
+  deal = deal || data;
 
-      const teamChanged = oldTeamId !== newTeamId;
-      const crewChanged = (oldCrewName || newCrewName) && (oldCrewName !== newCrewName);
-      console.log('[PD Hook] DEAL update teamChanged=%s crewChanged=%s oldTeam=%s newTeam=%s oldCrew=%s newCrew=%s', teamChanged, crewChanged, oldTeamId, newTeamId, oldCrewName, newCrewName);
-      if (!teamChanged && !crewChanged) return res.status(200).send('OK');
+  // Helpful visibility: what does the Production Team field look like on the deal right now?
+  console.log(
+    '[PD Hook] DEAL update field %s value=%s',
+    PRODUCTION_TEAM_FIELD_KEY,
+    JSON.stringify(deal[PRODUCTION_TEAM_FIELD_KEY])
+  );
 
-      const assignee = detectAssignee({ deal, activity: null });
-      // 🔥 DO NOT bail on missing channel — we can still rename subjects
-      if (!assignee.teamName) { console.log('[PD Hook] no crew name resolved from deal; abort rename'); return res.status(200).send('OK'); }
+  // 2) Resolve assignee from the *current* deal
+  const assignee = detectAssignee({ deal, activity: null });
+  console.log('[PD Hook] DEAL update assignee -> %j', assignee);
 
-      let jobChannelId = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+  // If we still can't figure out a crew name, there's nothing to rename to.
+  if (!assignee.teamName) {
+    console.log('[PD Hook] No crew name resolvable from deal; skipping rename.');
+    return res.status(200).send('OK');
+  }
 
-      const listRes = await fetch(`https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(deal.id)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`);
-      const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && isActivityFresh(a));
-      console.log('[PD Hook] DEAL update → open activities=%d, crew=%s', items.length, assignee.teamName);
+  // 3) Target job channel (for posting). Even if there isn’t one, we still rename subjects.
+  let jobChannelId = await resolveDealChannelId({
+    dealId,
+    allowDefault: ALLOW_DEFAULT_FALLBACK
+  });
+  if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      const oldChannel = (()=>{
-        if (oldTeamId && PRODUCTION_TEAM_TO_CHANNEL[oldTeamId]) return PRODUCTION_TEAM_TO_CHANNEL[oldTeamId];
-        if (oldCrewName) { const key = oldCrewName.toLowerCase(); return NAME_TO_CHANNEL[key] || null; }
-        return null;
-      })();
+  // 4) Pull all *open* activities on this deal and ensure their subjects reflect the current crew
+  const listRes = await fetch(
+    `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
+  );
+  const listJson = await listRes.json();
+  const items = (listJson?.data || []).filter(
+    (a) => a && (a.done === false || a.done === 0) && isActivityFresh(a)
+  );
+  console.log('[PD Hook] DEAL update → open activities=%d, crew=%s', items.length, assignee.teamName);
 
-      for (const activity of items) {
+  for (const activity of items) {
+    try {
+      if (!isBilledInvoiceSubject(activity.subject) && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
+        console.log(
+          `[RENAME/DEAL] aid=${activity.id} type=${activity.type} subj=${JSON.stringify(
+            activity.subject
+          )} -> crew=${assignee.teamName}`
+        );
+        await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+
+        // Refresh the subject locally (optional, just for nicer Slack text)
         try {
-          if (ENABLE_DELETE_ON_REASSIGN) {
-            if (oldChannel) await deleteAssigneePdfByMarker(activity.id, oldChannel, 200);
-            await deleteAssigneePost(activity.id);
-            const oldJobChannel = await resolveDealChannelId({ dealId: deal.id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-            if (oldJobChannel) await deleteAssigneePdfByMarker(activity.id, oldJobChannel, 400);
-          }
+          const a2 = await fetch(
+            `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+          );
+          const a2j = await a2.json();
+          if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
+        } catch {}
+      }
+
+      // Post work order (if you’re using Slack posting)
+      await postWorkOrderToChannels({
+        activity,
+        deal,
+        jobChannelId,
+        assigneeChannelId: assignee.channelId,
+        assigneeName: assignee.teamName,
+        noteText: activity.note
+      });
+    } catch (e) {
+      console.error('[WO] re-route/rename failed', activity?.id, e?.message || e);
+    }
+  }
+
+  return res.status(200).send('OK');
+}
+
 
           // Rename each open activity subject if needed
           if (!isBilledInvoiceSubject(activity.subject) && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
