@@ -18,13 +18,13 @@ const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
 const SIGNING_SECRET = process.env.WO_QR_SECRET;
 const DEFAULT_CHANNEL = process.env.DEFAULT_SLACK_CHANNEL_ID || 'C098H8GU355';
 const BASE_URL = process.env.BASE_URL;
-const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY;
+const PD_WEBHOOK_KEY = process.env.PD_WEBHOOK_KEY; // ?key=...
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
-const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null;
+const FORCE_CHANNEL_ID = process.env.FORCE_CHANNEL_ID || null; // optional override
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
-const ENABLE_PD_NOTE            = false;
+const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 
@@ -39,41 +39,44 @@ function shouldPostToJobChannel({ assigneeChannelId }){
   return true;
 }
 
-// Job-channel content style
+// Job-channel content style: 'summary' | 'pdf'
 const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
-// Skip invoice-like tasks entirely
+// Optional: skip invoice/billing tasks entirely (posting/processing). Renaming uses the same guard.
 const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false';
 const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice,ar follow up,accounts receivable')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
-// ===== Subject lists =====
+// ===== Subject lists (explicit, env-driven) =====
 function toSubjectListEnv(name){
-  return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  return (process.env[name] || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
 }
-const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');
-const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');
+const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');   // e.g. "Billed/Invoice,Final Invoice"
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');  // optional: subjects we never post/PDF
 
 function subjectMatchesList(subject, list){
   const n = normalizeForInvoice(subject || '');
   return list.some(s => normalizeForInvoice(s) === n);
 }
 
-// ===== Subject renaming controls =====
-const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // never|when_missing|always
-const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append';
+// ====== Subject renaming controls ======
+const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
+const RENAME_FORMAT = process.env.RENAME_FORMAT || 'append'; // 'append' keeps original subject and appends "— Crew: {name}"
 
 // ===== Debug flags =====
 const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
 
-// ===== Type-based gating =====
+// ====== Type-based gating for renames ======
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAME_TYPES_BLOCK)
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  : [];
+  : []; // ignored if allow-list exists
 
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN) throw new Error('Missing SLACK_BOT_TOKEN');
@@ -86,18 +89,21 @@ if (!PD_WEBHOOK_KEY) console.warn('⚠️ PD_WEBHOOK_KEY not set; /pipedrive-tas
 process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection:', r?.stack||r));
 process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
 
-/* ========= Dedup ========= */
+/* ========= Anti-spam / dedup ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
+
 const EVENT_CACHE = new Map();
-const EVENT_CACHE_TTL_MS = 60 * 1000;
+const EVENT_CACHE_TTL_MS = 60 * 1000; // 60s
 
 function alreadyHandledEvent(meta, activity){
   const id  = activity?.id || meta?.id || 'n/a';
   const ver = meta?.timestamp || meta?.time || activity?.update_time || activity?.add_time || Date.now();
   const key = `aid:${id}|v:${ver}`;
   const now = Date.now();
+
   const exp = EVENT_CACHE.get(key);
   if (exp && exp > now) return true;
+
   if (EVENT_CACHE.size > 1000){
     for (const [k, t] of EVENT_CACHE){ if (t <= now) EVENT_CACHE.delete(k); }
   }
@@ -114,6 +120,7 @@ function isActivityFresh(activity, maxDays = MAX_ACTIVITY_AGE_DAYS){
   if (!ref || isNaN(ref)) return true;
   return (now - ref.getTime()) <= maxDays * 86400000;
 }
+
 function isDealActive(deal){
   if (!deal) return true;
   const status = String(deal.status || '').toLowerCase();
@@ -123,10 +130,19 @@ function isDealActive(deal){
 }
 
 /* ========= Dictionaries ========= */
-const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
-const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
+const SERVICE_MAP = {
+  27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',
+  31:'General Cleaning',32:'Duct Cleaning'
+};
+const PRODUCTION_TEAM_MAP = {
+  47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',
+  53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5'
+};
+
+// PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
+// Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
   47: 'C09BXCCD95W',
   48: 'C09ASB1N32B',
@@ -142,11 +158,17 @@ const PRODUCTION_TEAM_TO_CHANNEL = {
   58: null, 59: null, 60: null
 };
 
+// Fallback name→channel for parsing "Crew: Name"
 const NAME_TO_CHANNEL = {
-  anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB', amber:'C09B49MJHEE', 'anna marie':'C09B85LE544', annamarie:'C09B85LE544',
-  kings:'C09BXCCD95W', penabad:'C09ASBE36Q7', johnathan:'C09ASB1N32B', gary:'C09AZ63JEJF', hector:'C09B6P5LVPY', sebastian:'C09AZ6VT459'
+  anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB', amber:'C09B49MJHEE',
+  'anna marie':'C09B85LE544', annamarie:'C09B85LE544',
+  kings:'C09BXCCD95W', penabad:'C09ASBE36Q7', johnathan:'C09ASB1N32B',
+  gary:'C09AZ63JEJF', hector:'C09B6P5LVPY', sebastian:'C09AZ6VT459'
 };
-const NAME_TO_TEAM_ID = { anastacio:52, mike:53, greg:55, amber:56, 'anna marie':57, annamarie:57, kings:47, penabad:49, johnathan:48, gary:54, hector:50, sebastian:51 };
+const NAME_TO_TEAM_ID = {
+  anastacio:52, mike:53, greg:55, amber:56, 'anna marie':57, annamarie:57,
+  kings:47, penabad:49, johnathan:48, gary:54, hector:50, sebastian:51
+};
 
 /* ========= Slack App ========= */
 const receiver = new ExpressReceiver({
@@ -237,18 +259,30 @@ async function postPdNote({ dealId, content }){
 
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
-// ===== Invoice detection =====
+// ===== Invoice detection (robust) =====
 function normalizeForInvoice(s=''){
-  return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
+  return String(s)
+    .toLowerCase()
+    .replace(/\s*\/\s*/g, '/')    // “billed / invoice” → “billed/invoice”
+    .replace(/\s+/g, ' ')           // collapse whitespace
+    .trim();
 }
 function isInvoiceLike(activity){
   if (!SKIP_INVOICE_TASKS) return false;
+
   const subjectNorm = normalizeForInvoice(activity?.subject || '');
   const noteNorm    = normalizeForInvoice(htmlToPlainText(activity?.note || ''));
+
+  // Exact (after normalization)
   const EXACTS = (process.env.INVOICE_EXACT_SUBJECTS || 'billed/invoice,invoice,invoice task,collect payment,final invoice,bill in 5 days')
-    .split(',').map(s => normalizeForInvoice(s)).filter(Boolean);
+    .split(',')
+    .map(s => normalizeForInvoice(s))
+    .filter(Boolean);
+
   if (EXACTS.includes(subjectNorm)) return true;
   if (subjectNorm.startsWith('invoice:') || subjectNorm.startsWith('invoice -') || subjectNorm.startsWith('billed/')) return true;
+
+  // Robust keyword block
   const escaped = INVOICE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   const re = new RegExp(`(?:^|\\b)(${escaped.join('|')})(?:\\b|$)`, 'i');
   return re.test(subjectNorm) || re.test(noteNorm);
@@ -262,13 +296,13 @@ function isBilledInvoiceSubject(subject){
 function getActivityTypeKey(a){ return String(a?.type || '').toLowerCase().trim(); }
 function isTypeAllowedForRename(activity){
   const t = getActivityTypeKey(activity);
-  if (!t) return true;
+  if (!t) return true; // if PD didn’t send a type, don’t block
   if (RENAME_TYPES_ALLOW.length) return RENAME_TYPES_ALLOW.includes(t);
   if (RENAME_TYPES_BLOCK.length) return !RENAME_TYPES_BLOCK.includes(t);
-  return true;
+  return true; // default allow
 }
 
-/* ========= Subject renaming ========= */
+/* ========= Subject renaming utils ========= */
 function normalizeCrewTag(name){
   if (!name) return null;
   const clean = String(name).trim().replace(/\s+/g,' ');
@@ -277,7 +311,7 @@ function normalizeCrewTag(name){
 function extractCrewTag(subject){
   if (!subject) return null;
   const m = String(subject).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
-  return m?.[0] || null;
+  return m?.[0] || null; // full "Crew: Name"
 }
 function extractCrewName(subject){
   const m = String(subject || '').match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
@@ -290,8 +324,14 @@ function buildRenamedSubject(original, assigneeName){
   if (!crewTag) return original || '';
   const subj = String(original || '').trim();
   const existing = extractCrewTag(subj);
-  if (existing) return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
-  if (RENAME_FORMAT === 'append') return subj ? `${subj} — ${crewTag}` : crewTag;
+  if (existing) {
+    // replace existing crew tag
+    return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
+  }
+  if (RENAME_FORMAT === 'append') {
+    return subj ? `${subj} — ${crewTag}` : crewTag;
+  }
+  // default fallback
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
@@ -323,7 +363,7 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
 }
 
 /* ========= Channel resolution ========= */
-const channelCache = new Map();
+const channelCache = new Map(); // dealId -> channelId
 
 async function findDealChannelId(dealId){
   if (!dealId) return null;
@@ -350,24 +390,26 @@ async function findDealChannelId(dealId){
   }
   return null;
 }
+
 async function ensureBotInChannel(channelId){
   if (!channelId) return;
   try{ await app.client.conversations.join({ channel: channelId }); }
   catch(e){ if (DEBUG_RENAME) console.warn('[WARN] bolt-app', e?.data?.error || e?.message || e); }
 }
+
 async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLBACK }){
   const byDeal = await findDealChannelId(dealId);
   if (byDeal) return byDeal;
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-/* ========= Assignee detection (robust to {value}) ========= */
+/* ========= Assignee detection ========= */
 function readEnumId(v){
   if (v && typeof v === 'object' && v.value != null) return v.value;
   return v;
 }
 function detectAssignee({ deal, activity }){
-  // 1) Activity field (if present)
+  // Activity field first
   if (activity) {
     const raw = activity[PRODUCTION_TEAM_FIELD_KEY];
     const aTid = readEnumId(raw);
@@ -375,7 +417,7 @@ function detectAssignee({ deal, activity }){
       return { teamId: String(aTid), teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
     }
   }
-  // 2) Deal field
+  // Deal field next
   if (deal) {
     const raw = deal[PRODUCTION_TEAM_FIELD_KEY];
     const dTid = readEnumId(raw);
@@ -383,7 +425,7 @@ function detectAssignee({ deal, activity }){
       return { teamId: String(dTid), teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
     }
   }
-  // 3) Fallback: parse "Crew: Name"
+  // Fallback: parse "Crew: Name"
   const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
   if (name){
@@ -397,7 +439,7 @@ function detectAssignee({ deal, activity }){
 }
 
 /* ========= Reassignment & completion tracking ========= */
-const ASSIGNEE_POSTS = new Map();
+const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
 const AID_TAG = (id)=>`[AID:${id}]`;
 
 /* ========= PDF builders ========= */
@@ -409,10 +451,12 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   const chunks = [];
   doc.on('data', c => chunks.push(c));
   const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
+
   doc.fontSize(20).text('Work Order', { align:'center' });
   doc.moveDown(0.25);
   doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' });
   doc.moveDown(1);
+
   const scheduled = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ').trim();
   doc.fillColor('#000').fontSize(12);
   doc.text(`Task: ${activity.subject || '-'}`);
@@ -423,12 +467,14 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.text(`Type of Service: ${typeOfService || '-'}`);
   doc.text(`Address: ${location || '-'}`);
   if (assigneeName) doc.text(`Assigned To: ${assigneeName}`);
+
   doc.moveDown(0.5);
   const rawNote = htmlToPlainText(activity.note || '');
   if (rawNote) {
     doc.font('Helvetica-Bold').text('Scope / Notes');
     doc.font('Helvetica').text(rawNote, { width: 520 });
   }
+
   doc.moveDown(0.5);
   doc.font('Helvetica-Bold').text('Scan to Complete');
   doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive.');
@@ -445,6 +491,7 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
   const chunks = [];
   doc.on('data', c => chunks.push(c));
   const finish = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
+
   doc.fontSize(20).text('Work Order Completed', { align: 'center' });
   doc.moveDown();
   doc.fontSize(12)
@@ -552,6 +599,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
 
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
 
+  // Job channel (respect mode + active deal)
   if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
     try {
@@ -564,6 +612,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     } catch(e){ console.warn('[WO] job channel post failed:', e?.data || e?.message || e); }
   }
 
+  // Assignee channel
   if (assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
     if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
@@ -582,7 +631,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
 }
 
-/* ========= Webhook ========= */
+/* ========= Webhook (activities + deal updates + deletes) ========= */
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
     if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) { return res.status(403).send('Forbidden'); }
@@ -632,10 +681,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const assignee = detectAssignee({ deal, activity });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify(assignee)}`);
 
+      // Rename policy: special-case Billed/Invoice → log note only; else conditional rename
       if (isBilledInvoiceSubject(activity.subject)) {
         if (assignee.teamName) await postPdNote({ dealId: activity.deal_id, content: `🧾 Crew assignment (no subject change): ${assignee.teamName}` });
       } else if (assignee.teamName && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
         await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        // refresh activity subject for subsequent posting (optional)
         try {
           const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
           const a2j = await a2.json();
@@ -647,100 +698,51 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-  // ===== Deal update (re-assign/rename all open activities, even if webhook diff is vague) =====
-if (entity === 'deal' && action === 'update') {
-  const dealId = data?.id;
-  if (!dealId) return res.status(200).send('No deal');
+    // ===== Deal update (re-assign/rename all open activities, even if webhook diff is vague) =====
+    if (entity === 'deal' && action === 'update') {
+      const dealId = data?.id;
+      if (!dealId) return res.status(200).send('No deal');
 
-  // 1) Always fetch the full, current deal so we see custom fields (webhook diffs often omit them)
-  let deal = null;
-  try {
-    const dRes = await fetch(
-      `https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`
-    );
-    const dJson = await dRes.json();
-    if (dJson?.success && dJson.data) deal = dJson.data;
-  } catch (e) {
-    console.warn('[PD Hook] DEAL fetch failed; falling back to webhook "data"', e?.message || e);
-  }
-  deal = deal || data;
+      // Always fetch the full, current deal so we see custom fields (webhook diffs often omit them)
+      let deal = null;
+      try {
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      } catch (e) {
+        console.warn('[PD Hook] DEAL fetch failed; falling back to webhook "data"', e?.message || e);
+      }
+      deal = deal || data;
 
-  // Helpful visibility: what does the Production Team field look like on the deal right now?
-  console.log(
-    '[PD Hook] DEAL update field %s value=%s',
-    PRODUCTION_TEAM_FIELD_KEY,
-    JSON.stringify(deal[PRODUCTION_TEAM_FIELD_KEY])
-  );
+      // Helpful visibility: what does the Production Team field look like on the deal right now?
+      console.log('[PD Hook] DEAL update field %s value=%s', PRODUCTION_TEAM_FIELD_KEY, JSON.stringify(deal[PRODUCTION_TEAM_FIELD_KEY]));
 
-  // 2) Resolve assignee from the *current* deal
-  const assignee = detectAssignee({ deal, activity: null });
-  console.log('[PD Hook] DEAL update assignee -> %j', assignee);
+      // Resolve assignee from the *current* deal
+      const assignee = detectAssignee({ deal, activity: null });
+      console.log('[PD Hook] DEAL update assignee -> %j', assignee);
 
-  // If we still can't figure out a crew name, there's nothing to rename to.
-  if (!assignee.teamName) {
-    console.log('[PD Hook] No crew name resolvable from deal; skipping rename.');
-    return res.status(200).send('OK');
-  }
-
-  // 3) Target job channel (for posting). Even if there isn’t one, we still rename subjects.
-  let jobChannelId = await resolveDealChannelId({
-    dealId,
-    allowDefault: ALLOW_DEFAULT_FALLBACK
-  });
-  if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
-
-  // 4) Pull all *open* activities on this deal and ensure their subjects reflect the current crew
-  const listRes = await fetch(
-    `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
-  );
-  const listJson = await listRes.json();
-  const items = (listJson?.data || []).filter(
-    (a) => a && (a.done === false || a.done === 0) && isActivityFresh(a)
-  );
-  console.log('[PD Hook] DEAL update → open activities=%d, crew=%s', items.length, assignee.teamName);
-
-  for (const activity of items) {
-    try {
-      if (!isBilledInvoiceSubject(activity.subject) && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
-        console.log(
-          `[RENAME/DEAL] aid=${activity.id} type=${activity.type} subj=${JSON.stringify(
-            activity.subject
-          )} -> crew=${assignee.teamName}`
-        );
-        await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-
-        // Refresh the subject locally (optional, just for nicer Slack text)
-        try {
-          const a2 = await fetch(
-            `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`
-          );
-          const a2j = await a2.json();
-          if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
-        } catch {}
+      if (!assignee.teamName) {
+        console.log('[PD Hook] No crew name resolvable from deal; skipping rename.');
+        return res.status(200).send('OK');
       }
 
-      // Post work order (if you’re using Slack posting)
-      await postWorkOrderToChannels({
-        activity,
-        deal,
-        jobChannelId,
-        assigneeChannelId: assignee.channelId,
-        assigneeName: assignee.teamName,
-        noteText: activity.note
-      });
-    } catch (e) {
-      console.error('[WO] re-route/rename failed', activity?.id, e?.message || e);
-    }
-  }
+      let jobChannelId = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
+      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-  return res.status(200).send('OK');
-}
+      // Pull all *open* activities on this deal and ensure subjects reflect the current crew
+      const listRes = await fetch(
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
+      );
+      const listJson = await listRes.json();
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && isActivityFresh(a));
+      console.log('[PD Hook] DEAL update → open activities=%d, crew=%s', items.length, assignee.teamName);
 
-
-          // Rename each open activity subject if needed
+      for (const activity of items) {
+        try {
           if (!isBilledInvoiceSubject(activity.subject) && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
             console.log(`[RENAME/DEAL] aid=${activity.id} type=${activity.type} subj=${JSON.stringify(activity.subject)} -> crew=${assignee.teamName}`);
             await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+            // Refresh the subject locally (optional)
             try {
               const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
               const a2j = await a2.json();
@@ -748,9 +750,16 @@ if (entity === 'deal' && action === 'update') {
             } catch {}
           }
 
-          await postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId: assignee.channelId, assigneeName: assignee.teamName, noteText: activity.note });
+          await postWorkOrderToChannels({
+            activity,
+            deal,
+            jobChannelId,
+            assigneeChannelId: assignee.channelId,
+            assigneeName: assignee.teamName,
+            noteText: activity.note
+          });
         } catch (e) {
-          console.error('[WO] re-route failed', activity?.id, e?.message||e);
+          console.error('[WO] re-route/rename failed', activity?.id, e?.message || e);
         }
       }
 
@@ -773,7 +782,7 @@ if (entity === 'deal' && action === 'update') {
   }
 });
 
-/* ========= QR Complete ========= */
+/* ========= QR Complete (ONLY path to completion) ========= */
 expressApp.get('/wo/complete', async (req, res) => {
   try {
     const { aid, did, cid, exp, sig } = req.query || {};
@@ -884,7 +893,10 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     }
 
     const channelIdForQr = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
-    const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
+    const pdfBuffer = await buildWorkOrderPdfBuffer({
+      activity: data, dealTitle, typeOfService, location,
+      channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id
+    });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
     return res.send(pdfBuffer);
@@ -895,4 +907,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 });
 
 /* ========= Start ========= */
-(async () => { await app.start(PORT); console.log(`✅ Dispatcher running on port ${PORT}`); })();
+(async () => {
+  await app.start(PORT);
+  console.log(`✅ Dispatcher running on port ${PORT}`);
+})();
