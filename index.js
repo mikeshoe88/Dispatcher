@@ -72,6 +72,20 @@ const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAM
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
 
+// ===== Crew chief auto-invite (new) =====
+const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
+const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
+function parseChiefMap(raw=''){
+  const map = {};
+  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+    const [name, idsRaw] = pair.split(':');
+    if (!name || !idsRaw) continue;
+    map[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
+  }
+  return map;
+}
+const TEAM_TO_CHIEF = parseChiefMap(process.env.CREW_CHIEF_MAP || '');
+
 /* ===== Required envs ===== */
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
 if (!SLACK_BOT_TOKEN)      throw new Error('Missing SLACK_BOT_TOKEN');
@@ -486,6 +500,37 @@ function buildJobChannelNotice({ activity, deal, assigneeName }){
   ].join('\n');
 }
 
+/* ========= Invite helpers (new) ========= */
+async function inviteUsersToChannel(channelId, userIds=[]){
+  if (!channelId || !userIds.length) return;
+  try {
+    await app.client.conversations.invite({ channel: channelId, users: userIds.join(',') });
+  } catch (e) {
+    console.warn('[INVITE] invite failed:', e?.data?.error || e?.message || e);
+  }
+}
+
+async function resolveChiefSlackIds({ assigneeName, deal }){
+  const out = new Set();
+  const key = String(assigneeName || '').trim().toLowerCase();
+  for (const id of (TEAM_TO_CHIEF[key] || [])) out.add(id);
+
+  if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
+    const email = (typeof deal[CREW_CHIEF_EMAIL_FIELD_KEY] === 'object' && deal[CREW_CHIEF_EMAIL_FIELD_KEY].value)
+      ? deal[CREW_CHIEF_EMAIL_FIELD_KEY].value
+      : deal[CREW_CHIEF_EMAIL_FIELD_KEY];
+    if (email && /@/.test(String(email))){
+      try {
+        const u = await app.client.users.lookupByEmail({ email: String(email).trim() });
+        if (u?.user?.id) out.add(u.user.id);
+      } catch (e) {
+        console.warn('[INVITE] lookupByEmail failed:', email, e?.data?.error || e?.message || e);
+      }
+    }
+  }
+  return [...out];
+}
+
 /* ========= Core post ========= */
 async function uploadPdfToSlack({ channel, filename, pdfBuffer, title, initialComment='' }){
   return app.client.files.uploadV2({
@@ -508,7 +553,6 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
 }
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
-// Updated to suppress PDFs/assignee posts for invoice-like tasks
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
@@ -516,15 +560,13 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
   const location = deal?.location || 'N/A';
 
+  // Keep a copy for invitations even if we suppress duplicate posting later
+  const inviteChannelId = jobChannelId || null;
+
   // If job and assignee channels are identical, post only once (prefer assignee channel/PDF)
   if (jobChannelId && assigneeChannelId && jobChannelId === assigneeChannelId) {
     jobChannelId = null;
   }
-
-  // Determine whether this is an invoice-like task
-  const isInvoice = isInvoiceLike(activity) || subjectMatchesList(activity.subject, NEVER_PROCESS_SUBJECTS);
-  const allowAssigneePost = !isInvoice; // block production channel for invoice tasks
-  const allowPdf          = !isInvoice; // don't generate/upload PDFs for invoice tasks
 
   let customerName = null;
   try {
@@ -536,40 +578,45 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     }
   } catch {}
 
-  // Build PDF only when allowed
-  let pdfBuffer = null;
-  let filename  = null;
-  if (allowPdf) {
-    pdfBuffer = await buildWorkOrderPdfBuffer({
-      activity, dealTitle, typeOfService, location,
-      channelForQR: jobChannelId || DEFAULT_CHANNEL, assigneeName,
-      customerName, jobNumber: deal?.id
-    });
+  const pdfBuffer = await buildWorkOrderPdfBuffer({
+    activity, dealTitle, typeOfService, location,
+    channelForQR: (inviteChannelId || DEFAULT_CHANNEL), assigneeName,
+    customerName, jobNumber: deal?.id
+  });
 
-    const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
-    filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
-  }
-
+  const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
+  const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
+
+  // 🚀 NEW: auto-invite crew chief to the job/deal channel
+  if (INVITE_CREW_CHIEF && inviteChannelId){
+    await ensureBotInChannel(inviteChannelId);
+    try {
+      const chiefIds = await resolveChiefSlackIds({ assigneeName, deal });
+      if (chiefIds.length) await inviteUsersToChannel(inviteChannelId, chiefIds);
+    } catch (e) {
+      console.warn('[INVITE] chief invite error:', e?.message || e);
+    }
+  }
 
   // Job channel (respect mode + active deal)
   if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
     try {
-      if (JOB_CHANNEL_STYLE === 'summary' || !allowPdf || !ENABLE_SLACK_PDF_UPLOAD) {
+      if (JOB_CHANNEL_STYLE === 'summary') {
         const notice = buildJobChannelNotice({ activity, deal, assigneeName });
         await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
-      } else if (ENABLE_SLACK_PDF_UPLOAD && allowPdf && pdfBuffer) {
+      } else if (ENABLE_SLACK_PDF_UPLOAD) {
         await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
       }
     } catch(e){ console.warn('[WO] job channel post failed:', e?.data || e?.message || e); }
   }
 
-  // Assignee channel (blocked for invoice-like tasks)
-  if (allowAssigneePost && assigneeChannelId){
+  // Assignee channel
+  if (assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
     if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
-    if (ENABLE_SLACK_PDF_UPLOAD && allowPdf && pdfBuffer){
+    if (ENABLE_SLACK_PDF_UPLOAD){
       try {
         const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
         const fids = [];
@@ -581,9 +628,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     }
   }
 
-  if (allowPdf && ENABLE_PD_FILE_UPLOAD && pdfBuffer){
-    try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); }
-  }
+  if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
 }
 
 /* ========= Signed QR link ========= */
@@ -816,7 +861,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`,{
+      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}` ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
