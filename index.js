@@ -508,6 +508,7 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
 }
 function getTimeField(v){ if(!v) return ''; if(typeof v==='string') return v; if(typeof v==='object' && v.value) return String(v.value); return ''; }
 
+// Updated to suppress PDFs/assignee posts for invoice-like tasks
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
@@ -520,6 +521,11 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     jobChannelId = null;
   }
 
+  // Determine whether this is an invoice-like task
+  const isInvoice = isInvoiceLike(activity) || subjectMatchesList(activity.subject, NEVER_PROCESS_SUBJECTS);
+  const allowAssigneePost = !isInvoice; // block production channel for invoice tasks
+  const allowPdf          = !isInvoice; // don't generate/upload PDFs for invoice tasks
+
   let customerName = null;
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
@@ -530,34 +536,40 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     }
   } catch {}
 
-  const pdfBuffer = await buildWorkOrderPdfBuffer({
-    activity, dealTitle, typeOfService, location,
-    channelForQR: jobChannelId || DEFAULT_CHANNEL, assigneeName,
-    customerName, jobNumber: deal?.id
-  });
+  // Build PDF only when allowed
+  let pdfBuffer = null;
+  let filename  = null;
+  if (allowPdf) {
+    pdfBuffer = await buildWorkOrderPdfBuffer({
+      activity, dealTitle, typeOfService, location,
+      channelForQR: jobChannelId || DEFAULT_CHANNEL, assigneeName,
+      customerName, jobNumber: deal?.id
+    });
 
-  const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
-  const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
+    const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
+    filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
+  }
+
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
 
   // Job channel (respect mode + active deal)
   if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
     try {
-      if (JOB_CHANNEL_STYLE === 'summary') {
+      if (JOB_CHANNEL_STYLE === 'summary' || !allowPdf || !ENABLE_SLACK_PDF_UPLOAD) {
         const notice = buildJobChannelNotice({ activity, deal, assigneeName });
         await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
-      } else if (ENABLE_SLACK_PDF_UPLOAD) {
+      } else if (ENABLE_SLACK_PDF_UPLOAD && allowPdf && pdfBuffer) {
         await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
       }
     } catch(e){ console.warn('[WO] job channel post failed:', e?.data || e?.message || e); }
   }
 
-  // Assignee channel
-  if (assigneeChannelId){
+  // Assignee channel (blocked for invoice-like tasks)
+  if (allowAssigneePost && assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
     if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
-    if (ENABLE_SLACK_PDF_UPLOAD){
+    if (ENABLE_SLACK_PDF_UPLOAD && allowPdf && pdfBuffer){
       try {
         const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
         const fids = [];
@@ -569,7 +581,9 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     }
   }
 
-  if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); } }
+  if (allowPdf && ENABLE_PD_FILE_UPLOAD && pdfBuffer){
+    try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e); }
+  }
 }
 
 /* ========= Signed QR link ========= */
