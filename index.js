@@ -181,6 +181,50 @@ function isDueTodayCT(activity){
   return d === today;
 }
 
+// === Start-time parsing (CT) + comparator ===
+function _normalizeTime(val){
+  if (val == null) return '';
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'object' && val.value != null) return String(val.value).trim();
+  if (typeof val === 'number') {
+    const secs = val > 300 ? val : val * 60;
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  return String(val).trim();
+}
+
+function parseDueDateTimeCT(activity){
+  const d = String(activity?.due_date || '').trim();
+  const tRaw = _normalizeTime(activity?.due_time);
+  if (!d) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+
+  const t = tRaw && /\d{1,2}:\d{2}/.test(tRaw)
+    ? (tRaw.length === 5 ? tRaw + ':00' : tRaw)
+    : '23:59:00';
+
+  try{
+    const dt = DateTime.fromISO(`${d}T${t}`, { zone: TZ });
+    if (!dt.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+    const dateLabel = dt.toFormat('MM/dd/yyyy');
+    const timeLabel = tRaw ? (dt.toFormat('h:mm a') + ' CT') : '';
+    return { dt, dateLabel, timeLabel, iso: dt.toISO() };
+  }catch{
+    return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+  }
+}
+
+function compareByStartTime(a, b){
+  const pa = parseDueDateTimeCT(a);
+  const pb = parseDueDateTimeCT(b);
+  if (!pa.dt && !pb.dt) return 0;
+  if (!pa.dt) return 1;
+  if (!pb.dt) return -1;
+  return pa.dt.toMillis() - pb.dt.toMillis();
+}
+
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
 const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
