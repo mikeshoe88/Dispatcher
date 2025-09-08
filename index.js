@@ -419,19 +419,28 @@ const AID_TAG = (id)=>`[AID:${id}]`;
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
   const completeUrl = makeSignedCompleteUrl({ aid: String(activity.id), did: activity.deal_id ? String(activity.deal_id) : '', cid: channelForQR || DEFAULT_CHANNEL });
   const qrDataUrl = await QRCode.toDataURL(completeUrl);
-  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64\,/,''),'base64');
+  const qrBuffer = Buffer.from(qrDataUrl.replace(/^data:image\/png;base64,/, ''), 'base64');
   const doc = new PDFDocument({ margin: 36 });
   const chunks = [];
   doc.on('data', c => chunks.push(c));
-  const done = new Promise(r => doc.on('end', ()=>r(Buffer.concat(chunks))));
-  doc.fontSize(20).text('Work Order', { align:'center' });
+  const done = new Promise(r => doc.on('end', () => r(Buffer.concat(chunks))));
+
+  // Header
+  doc.fontSize(20).text('Work Order', { align: 'center' });
   doc.moveDown(0.25);
-  doc.fontSize(10).fillColor('#666').text(new Date().toLocaleString(), { align:'center' });
+  // ✅ Show when Dispatcher generated the PDF (Central Time)
+  doc.fontSize(10).fillColor('#666')
+     .text(`Generated: ${DateTime.now().setZone(TZ).toFormat('MM/dd/yyyy, h:mm:ss a')} CT`, { align: 'center' });
   doc.moveDown(1);
-  const scheduled = [activity.due_date, getTimeField(activity.due_time)].filter(Boolean).join(' ').trim();
+
+  // ✅ Parse due_date + due_time into nice labels
+  const { dateLabel: dueDateLbl, timeLabel: dueTimeLbl } = parseDueDateTimeCT(activity);
+
+  // Body
   doc.fillColor('#000').fontSize(12);
   doc.text(`Task: ${activity.subject || '-'}`);
-  doc.text(`Due:  ${scheduled || '-'}`);
+  doc.text(`Due Date:  ${dueDateLbl || '-'}`);
+  doc.text(`Start Time: ${dueTimeLbl || '-'}`);
   doc.text(`Deal: ${dealTitle || '-'}`);
   doc.text(`Job Number: ${jobNumber || activity.deal_id || '-'}`);
   if (customerName) doc.text(`Customer: ${customerName}`);
@@ -439,6 +448,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.text(`Address: ${location || '-'}`);
   if (assigneeName) doc.text(`Assigned To: ${assigneeName}`);
   doc.moveDown(0.5);
+
   const rawNote = htmlToPlainText(activity.note || '');
   if (rawNote) {
     doc.font('Helvetica-Bold').text('Scope / Notes');
@@ -448,7 +458,7 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.font('Helvetica-Bold').text('Scan to Complete');
   doc.font('Helvetica').fontSize(10).fillColor('#555').text('Scanning marks this task complete in Pipedrive.');
   doc.moveDown(0.5);
-  doc.image(qrBuffer, { fit:[120,120] });
+  doc.image(qrBuffer, { fit: [120, 120] });
   doc.moveDown(0.25);
   doc.fontSize(8).fillColor('#777').text(completeUrl, { width: 520 });
   doc.end();
@@ -478,6 +488,7 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
   doc.end();
   return finish;
 }
+
 
 /* ========= Delete helpers ========= */
 async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
