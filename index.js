@@ -895,10 +895,24 @@ return res.status(200).send('OK');
           }
 
           // Only post immediately if due today
-          if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-            console.log('[WO] deferred (deal update; not due today): aid=%s due=%s', activity.id, activity.due_date);
-            continue;
-          }
+if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+  console.log(
+    '[WO] deferred (deal update; not due today): aid=%s due=%s → cleaning up any posted WO',
+    activity.id,
+    activity.due_date
+  );
+  try {
+    await deleteAssigneePost(activity.id);
+    const jobCh = await resolveDealChannelId({
+      dealId: activity.deal_id,
+      allowDefault: ALLOW_DEFAULT_FALLBACK
+    });
+    if (jobCh) await deleteAssigneePdfByMarker(activity.id, jobCh, 400);
+  } catch (e) {
+    console.warn('[WO] cleanup on deal-update date-change failed', e?.message || e);
+  }
+  continue;
+}
 
           if (!shouldPostNow(activity.id)) {
             console.log('[WO] skip duplicate post aid=%s (recent)', activity.id);
