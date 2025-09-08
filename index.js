@@ -504,7 +504,6 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.moveDown(0.5);
   doc.image(qrBuffer, { fit: [120, 120] });
   doc.moveDown(0.25);
-  doc.fontSize(8).fillColor('#777').text(completeUrl, { width: 520 });
   doc.end();
   return done;
 }
