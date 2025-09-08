@@ -815,23 +815,40 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
 
       // post now ONLY if due today (unless POST_FUTURE_WOS enabled)
-      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-        console.log('[WO] deferred (not due today): aid=%s due=%s', activity.id, activity.due_date);
-        return res.status(200).send('OK');
-      }
+if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+  console.log(
+    '[WO] deferred (not due today): aid=%s due=%s → cleaning up any posted WO',
+    activity.id,
+    activity.due_date
+  );
+  try {
+    // remove assignee-channel post (and any uploaded file)
+    await deleteAssigneePost(activity.id);
 
-      if (!shouldPostNow(activity.id)) {
-        console.log('[WO] skip duplicate post aid=%s (recent)', activity.id);
-      } else {
-        await postWorkOrderToChannels({
-          activity, deal, jobChannelId,
-          assigneeChannelId: assignee.channelId,
-          assigneeName: assignee.teamName,
-          noteText: activity.note
-        });
-      }
-      return res.status(200).send('OK');
-    }
+    // also try job/deal channel by AID marker (in case it was posted there)
+    const jobCh = await resolveDealChannelId({
+      dealId: activity.deal_id,
+      allowDefault: ALLOW_DEFAULT_FALLBACK
+    });
+    if (jobCh) await deleteAssigneePdfByMarker(activity.id, jobCh, 400);
+  } catch (e) {
+    console.warn('[WO] cleanup on date-change failed', e?.message || e);
+  }
+  return res.status(200).send('OK');
+}
+
+if (!shouldPostNow(activity.id)) {
+  console.log('[WO] skip duplicate post aid=%s (recent)', activity.id);
+} else {
+  await postWorkOrderToChannels({
+    activity, deal, jobChannelId,
+    assigneeChannelId: assignee.channelId,
+    assigneeName: assignee.teamName,
+    noteText: activity.note
+  });
+}
+return res.status(200).send('OK');
+
 
     // ===== Deal update: re-assign/rename all open activities =====
     if (entity === 'deal' && action === 'update') {
