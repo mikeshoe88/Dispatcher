@@ -871,6 +871,8 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
+    dueToday.sort(compareByStartTime);
+
 
     let posted = 0;
     for (const activity of dueToday) {
