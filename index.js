@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import PDFDocument from 'pdfkit';
 import QRCode from 'qrcode';
 import FormData from 'form-data';
+import { DateTime } from 'luxon';
 
 /* ========= ENV / CONSTANTS ========= */
 const PORT = process.env.PORT || 3000;
@@ -21,12 +22,14 @@ const BASE_URL             = process.env.BASE_URL;
 const PD_WEBHOOK_KEY       = process.env.PD_WEBHOOK_KEY;
 const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID     = process.env.FORCE_CHANNEL_ID || null;
+const TZ = 'America/Chicago';
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
+const POST_FUTURE_WOS           = process.env.POST_FUTURE_WOS === 'true';
 
 // Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
 const JOB_CHANNEL_MODE  = (process.env.JOB_CHANNEL_MODE || 'on_assigned').toLowerCase();
@@ -72,7 +75,7 @@ const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAM
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
 
-// ===== Crew chief auto-invite (new) =====
+// ===== Crew chief auto-invite =====
 const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
 const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
 function parseChiefMap(raw=''){
@@ -85,6 +88,28 @@ function parseChiefMap(raw=''){
   return map;
 }
 const TEAM_TO_CHIEF = parseChiefMap(process.env.CREW_CHIEF_MAP || '');
+
+// 🔁 NEW: person-name based fallbacks (e.g., Kim Kay)
+function parseNameToChannel(raw=''){
+  const out = {};
+  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+    const [name, chan] = pair.split(':');
+    if (!name || !chan) continue;
+    out[name.trim().toLowerCase()] = chan.trim();
+  }
+  return out;
+}
+function parseNameToSlackMap(raw=''){
+  const out = {};
+  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+    const [name, idsRaw] = pair.split(':');
+    if (!name || !idsRaw) continue;
+    out[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
+  }
+  return out;
+}
+const CHIEF_NAME_TO_CHANNEL      = parseNameToChannel(process.env.CHIEF_NAME_TO_CHANNEL || '');
+const CREW_CHIEF_NAME_TO_SLACK   = parseNameToSlackMap(process.env.CREW_CHIEF_NAME_TO_SLACK || '');
 
 /* ===== Required envs ===== */
 if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
@@ -146,6 +171,14 @@ function isDealActive(deal){
   if (status && status !== 'open') return false;
   if (deal.active_flag === false) return false;
   return true;
+}
+
+/* ========= Date helpers ========= */
+function isDueTodayCT(activity){
+  const d = (activity?.due_date||'').trim();
+  if (!d) return false;
+  const today = DateTime.now().setZone(TZ).toISODate();
+  return d === today;
 }
 
 /* ========= Dictionaries ========= */
@@ -338,7 +371,7 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 /* ========= Assignee detection (robust to {value}) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 function detectAssignee({ deal, activity }){
-  // 1) Activity field
+  // 1) Activity field (enum)
   if (activity) {
     const raw = activity[PRODUCTION_TEAM_FIELD_KEY];
     const aTid = readEnumId(raw);
@@ -346,7 +379,7 @@ function detectAssignee({ deal, activity }){
       return { teamId: String(aTid), teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
     }
   }
-  // 2) Deal field
+  // 2) Deal field (enum)
   if (deal) {
     const raw = deal[PRODUCTION_TEAM_FIELD_KEY];
     const dTid = readEnumId(raw);
@@ -359,10 +392,21 @@ function detectAssignee({ deal, activity }){
   const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
   if (name){
     const key = name.toLowerCase();
-    const channelId = NAME_TO_CHANNEL[key] || null;
+    const channelId = NAME_TO_CHANNEL[key] || CHIEF_NAME_TO_CHANNEL[key] || null;
     const teamId = NAME_TO_TEAM_ID[key] || null;
     const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
     return { teamId: teamId ? String(teamId) : null, teamName, channelId };
+  }
+  // 4) NEW: person-assignee fallback from activity owner/user
+  const personName =
+    activity?.user_id?.name ||
+    activity?.assigned_to_user_id?.name ||
+    activity?.owner_name ||
+    null;
+  if (personName){
+    const key = normalizeName(personName);
+    const channelId = CHIEF_NAME_TO_CHANNEL[key] || NAME_TO_CHANNEL[key] || null;
+    return { teamId: null, teamName: personName, channelId };
   }
   return { teamId:null, teamName:null, channelId:null };
 }
@@ -500,7 +544,7 @@ function buildJobChannelNotice({ activity, deal, assigneeName }){
   ].join('\n');
 }
 
-/* ========= Invite helpers (new) ========= */
+/* ========= Invite helpers ========= */
 async function inviteUsersToChannel(channelId, userIds=[]){
   if (!channelId || !userIds.length) return;
   try {
@@ -513,7 +557,10 @@ async function inviteUsersToChannel(channelId, userIds=[]){
 async function resolveChiefSlackIds({ assigneeName, deal }){
   const out = new Set();
   const key = String(assigneeName || '').trim().toLowerCase();
+  // team-based mapping
   for (const id of (TEAM_TO_CHIEF[key] || [])) out.add(id);
+  // name-based mapping 🔁 NEW
+  for (const id of (CREW_CHIEF_NAME_TO_SLACK[key] || [])) out.add(id);
 
   if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
     const email = (typeof deal[CREW_CHIEF_EMAIL_FIELD_KEY] === 'object' && deal[CREW_CHIEF_EMAIL_FIELD_KEY].value)
@@ -588,7 +635,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
 
-  // 🚀 NEW: auto-invite crew chief to the job/deal channel
+  // 🚀 auto-invite crew chief to the job/deal channel
   if (INVITE_CREW_CHIEF && inviteChannelId){
     await ensureBotInChannel(inviteChannelId);
     try {
@@ -713,7 +760,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         } catch {}
       }
 
-      // post (guarded by short post-dedupe window)
+      // post now ONLY if due today (unless POST_FUTURE_WOS enabled)
+      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+        console.log('[WO] deferred (not due today): aid=%s due=%s', activity.id, activity.due_date);
+        return res.status(200).send('OK');
+      }
+
       if (!shouldPostNow(activity.id)) {
         console.log('[WO] skip duplicate post aid=%s (recent)', activity.id);
       } else {
@@ -771,6 +823,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             } catch {}
           }
 
+          // Only post immediately if due today
+          if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+            console.log('[WO] deferred (deal update; not due today): aid=%s due=%s', activity.id, activity.due_date);
+            continue;
+          }
+
           if (!shouldPostNow(activity.id)) {
             console.log('[WO] skip duplicate post aid=%s (recent)', activity.id);
           } else {
@@ -802,6 +860,47 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   } catch (error) {
     console.error('[PD Hook] ERROR:', error?.stack || error?.data || error?.message || error);
     return res.status(500).send('Server error.');
+  }
+});
+
+/* ========= 7:00 AM CT daily runner ========= */
+expressApp.get('/dispatch/run-7am', async (_req, res) => {
+  try {
+    const today = DateTime.now().setZone(TZ).toISODate();
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const listJson = await listRes.json();
+    const all = Array.isArray(listJson?.data) ? listJson.data : [];
+    const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
+
+    let posted = 0;
+    for (const activity of dueToday) {
+      // refresh deal & assignee like webhook path
+      let deal = null;
+      if (activity.deal_id){
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      }
+      if (deal && !isDealActive(deal)) continue;
+
+      let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
+      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+      const assignee = detectAssignee({ deal, activity });
+
+      if (!shouldPostNow(activity.id)) continue;
+
+      await postWorkOrderToChannels({
+        activity, deal, jobChannelId,
+        assigneeChannelId: assignee.channelId,
+        assigneeName: assignee.teamName,
+        noteText: activity.note
+      });
+      posted++;
+    }
+    res.status(200).send(`OK – posted ${posted} due-today WOs`);
+  } catch (e) {
+    console.error('[7AM] runner error', e?.message||e);
+    res.status(500).send('error');
   }
 });
 
