@@ -814,55 +814,77 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     }
 
     // ===== Deal update: re-assign/rename all open activities =====
-    if (entity === 'deal' && action === 'update') {
-      const dealId = data?.id;
-      if (!dealId) return res.status(200).send('No deal');
+if (entity === 'deal' && action === 'update') {
+  const dealId = data?.id;
+  if (!dealId) return res.status(200).send('No deal');
 
-      // fetch full, current deal (webhook diffs often omit custom fields)
-      let deal = null;
-      try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-        const dJson = await dRes.json();
-        if (dJson?.success && dJson.data) deal = dJson.data;
-      } catch (e) {
-        console.warn('[PD Hook] DEAL fetch failed; falling back to webhook data', e?.message || e);
-      }
-      deal = deal || data;
+  // fetch full, current deal (webhook diffs often omit custom fields)
+  let deal = null;
+  try {
+    const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const dJson = await dRes.json();
+    if (dJson?.success && dJson.data) deal = dJson.data;
+  } catch (e) {
+    console.warn('[PD Hook] DEAL fetch failed; falling back to webhook data', e?.message || e);
+  }
+  deal = deal || data;
 
-      const assignee = detectAssignee({ deal, activity: null });
-      let jobChannelId = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
-      if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
+  // list all OPEN activities on this deal
+  const listRes = await fetch(
+    `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
+  );
+  const listJson = await listRes.json();
+  const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && isActivityFresh(a));
 
-      const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
-      );
-      const listJson = await listRes.json();
-      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0) && isActivityFresh(a));
+  // Resolve job channel once
+  let jobChannelId = await resolveDealChannelId({ dealId, allowDefault: ALLOW_DEFAULT_FALLBACK });
+  if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
-      for (const activity of items) {
-        // Only post immediately if due today — otherwise clean up any prior post
-        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          console.log('[WO] deferred (deal update; not due today): aid=%s due=%s → cleaning up', activity.id, activity.due_date);
+  for (const activity of items) {
+    // Recompute assignee per-activity (activity enum overrides deal enum)
+    const ass = detectAssignee({ deal, activity });
+
+    // ✏️ Always try to rename on deal updates (unless invoice-like / blocked type)
+    try {
+      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && ass.teamName) {
+        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
+        if (r?.did) {
+          // refresh local subject so Slack text shows the new crew
           try {
-            await deleteAssigneePost(activity.id);
-            const jobCh = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
-            if (jobCh) await deleteAssigneePdfByMarker(activity.id, jobCh, 400);
-          } catch (e) { console.warn('[WO] cleanup on deal-update date-change failed', e?.message || e); }
-          continue;
+            const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+            const a2j = await a2.json();
+            if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
+          } catch {}
         }
-
-        if (!shouldPostNow(activity.id)) { continue; }
-
-        await postWorkOrderToChannels({
-          activity, deal, jobChannelId,
-          assigneeChannelId: assignee.channelId,
-          assigneeName: assignee.teamName,
-          noteText: activity.note
-        });
       }
-
-      return res.status(200).send('OK');
+    } catch (e) {
+      console.warn('[WO] rename on DEAL update failed', activity.id, e?.message || e);
     }
+
+    // Posting behavior (unchanged): only post if due today (or POST_FUTURE_WOS)
+    if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+      // Clean up any prior assignee/job-channel post if date bumped out of today
+      try {
+        await deleteAssigneePost(activity.id);
+        const jobCh = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
+        if (jobCh) await deleteAssigneePdfByMarker(activity.id, jobCh, 400);
+      } catch (e) { console.warn('[WO] cleanup on deal-update date-change failed', e?.message || e); }
+      continue;
+    }
+
+    if (!shouldPostNow(activity.id)) continue;
+
+    await postWorkOrderToChannels({
+      activity, deal, jobChannelId,
+      assigneeChannelId: ass.channelId,
+      assigneeName: ass.teamName,
+      noteText: activity.note
+    });
+  }
+
+  return res.status(200).send('OK');
+}
+
 
     // ===== Activity delete =====
     if (entity === 'activity' && (action === 'delete')) {
