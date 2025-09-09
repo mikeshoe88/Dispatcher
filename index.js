@@ -236,7 +236,7 @@ const PRODUCTION_TEAM_TO_CHANNEL = {
   52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE', 57: 'C09B85LE544',
   58: null, 59: null, 60: null
 };
-// Fallback name→channel for parsing "Crew: Name"
+// Fallback name→channel (kept for other features if needed)
 const NAME_TO_CHANNEL = {
   anastacio:'C09BA0XUAV7', mike:'C098H8GU355', greg:'C09BFFGBYTB', amber:'C09B49MJHEE', 'anna marie':'C09B85LE544', annamarie:'C09B85LE544',
   kings:'C09BXCCD95W', penabad:'C09ASBE36Q7', johnathan:'C09ASB1N32B', gary:'C09AZ63JEJF', hector:'C09B6P5LVPY', sebastian:'C09AZ6VT459'
@@ -412,7 +412,7 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-/* ========= Assignee detection (robust to {value}) ========= */
+/* ========= Assignee detection (enum-only) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 function detectAssignee({ deal, activity }) {
   // ONLY use the Production Team enum (activity first, then deal)
@@ -430,38 +430,6 @@ function detectAssignee({ deal, activity }) {
 
   // No fallbacks
   return { teamId: null, teamName: null, channelId: null };
-}
-
-  // 2) Deal field (enum)
-  if (deal) {
-    const raw = deal[PRODUCTION_TEAM_FIELD_KEY];
-    const dTid = readEnumId(raw);
-    if (dTid && PRODUCTION_TEAM_TO_CHANNEL[dTid]) {
-      return { teamId: String(dTid), teamName: PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[dTid] };
-    }
-  }
-  // 3) Fallback via "Crew: Name" in title/subject
-  const crewFrom = (s) => (s ? (String(s).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i)?.[1] || null) : null);
-  const name = crewFrom(deal?.title) || crewFrom(activity?.subject);
-  if (name){
-    const key = name.toLowerCase();
-    const channelId = NAME_TO_CHANNEL[key] || CHIEF_NAME_TO_CHANNEL[key] || null;
-    const teamId = NAME_TO_TEAM_ID[key] || null;
-    const teamName = PRODUCTION_TEAM_MAP[teamId] || (name.charAt(0).toUpperCase()+name.slice(1));
-    return { teamId: teamId ? String(teamId) : null, teamName, channelId };
-  }
-  // 4) NEW: person-assignee fallback from activity owner/user
-  const personName =
-    activity?.user_id?.name ||
-    activity?.assigned_to_user_id?.name ||
-    activity?.owner_name ||
-    null;
-  if (personName){
-    const key = normalizeName(personName);
-    const channelId = CHIEF_NAME_TO_CHANNEL[key] || NAME_TO_CHANNEL[key] || null;
-    return { teamId: null, teamName: personName, channelId };
-  }
-  return { teamId:null, teamName:null, channelId:null };
 }
 
 /* ========= Reassignment & completion tracking ========= */
