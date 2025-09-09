@@ -414,15 +414,24 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 
 /* ========= Assignee detection (robust to {value}) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
-function detectAssignee({ deal, activity }){
-  // 1) Activity field (enum)
-  if (activity) {
-    const raw = activity[PRODUCTION_TEAM_FIELD_KEY];
-    const aTid = readEnumId(raw);
-    if (aTid && PRODUCTION_TEAM_TO_CHANNEL[aTid]) {
-      return { teamId: String(aTid), teamName: PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`, channelId: PRODUCTION_TEAM_TO_CHANNEL[aTid] };
-    }
+function detectAssignee({ deal, activity }) {
+  // ONLY use the Production Team enum (activity first, then deal)
+  const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  const dTid = !aTid && deal ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  const tid  = aTid || dTid || null;
+
+  if (tid && PRODUCTION_TEAM_TO_CHANNEL[tid]) {
+    return {
+      teamId: String(tid),
+      teamName: PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`,
+      channelId: PRODUCTION_TEAM_TO_CHANNEL[tid]
+    };
   }
+
+  // No fallbacks
+  return { teamId: null, teamName: null, channelId: null };
+}
+
   // 2) Deal field (enum)
   if (deal) {
     const raw = deal[PRODUCTION_TEAM_FIELD_KEY];
