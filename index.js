@@ -227,14 +227,14 @@ function compareByStartTime(a, b){
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
-const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Slot 3',59:'Slot 4',60:'Slot 5' };
+const PRODUCTION_TEAM_MAP = { 47:'Kings',48:'Johnathan',49:'Penabad',50:'Hector',51:'Sebastian',52:'Anastacio',53:'Mike',54:'Gary',55:'Greg',56:'Amber',57:'Anna Marie',58:'Rosemary',59:'Slot 4',60:'Slot 5' };
 // PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
   47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09ASBE36Q7', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
   52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE', 57: 'C09B85LE544',
-  58: null, 59: null, 60: null
+  58: 'C09EQNJN960', 59: null, 60: null
 };
 // Fallback name→channel (kept for other features if needed)
 const NAME_TO_CHANNEL = {
