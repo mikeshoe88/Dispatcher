@@ -530,9 +530,15 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 
 /* ========= Assignee detection (enum-only) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
-function detectAssignee({ deal, activity }) {
+
+/**
+ * allowDealFallback:
+ *  - true  = if activity doesn't have a team, use the deal's team
+ *  - false = use activity-only; if absent, return null (do NOT fall back)
+ */
+function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  const dTid = !aTid && deal ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
   if (tid && PRODUCTION_TEAM_TO_CHANNEL[tid]) {
@@ -544,6 +550,7 @@ function detectAssignee({ deal, activity }) {
   }
   return { teamId: null, teamName: null, channelId: null };
 }
+
 
 /* ========= Reassignment & completion tracking ========= */
 const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
