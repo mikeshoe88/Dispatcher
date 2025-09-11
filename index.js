@@ -722,30 +722,90 @@ function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
 
 /* ========= Webhook ========= */
 expressApp.post('/pipedrive-task', async (req, res) => {
-  try {
-    if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) { return res.status(403).send('Forbidden'); }
+try {
+if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
+return res.status(403).send('Forbidden');
+}
 
-    const meta = req.body?.meta || {};
-    const rawEntity  = (meta.entity || '').toString().toLowerCase();
-    const rawAction  = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
 
-    const action = /^(create|add|added)$/.test(rawAction) ? 'create'
-                  : /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
-                  : /^(delete|deleted)$/.test(rawAction) ? 'delete'
-                  : rawAction || 'unknown';
+const meta = req.body?.meta || {};
+const rawEntity = (meta.entity || '').toString().toLowerCase();
+const rawAction = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
 
-    const entity = rawEntity || 'unknown';
-    const data   = req.body?.data || req.body?.current || null;
 
-    console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
+const action = /^(create|add|added)$/.test(rawAction) ? 'create'
+: /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
+: /^(delete|deleted)$/.test(rawAction) ? 'delete'
+: rawAction || 'unknown';
 
-    // ===== Activity create/update =====
-    if (entity === 'activity' && (action === 'create' || action === 'update')) {
-      if (!data?.id) return res.status(200).send('No activity');
 
-      if (data.done === true || data.done === 1) { return res.status(200).send('OK'); }
-      if (!isActivityFresh(data)) { return res.status(200).send('OK'); }
-      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) { return res.status(200).send('OK'); }
+const entity = rawEntity || 'unknown';
+const data = req.body?.data || req.body?.current || null;
+
+
+console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
+
+
+// ===== Activity create/update =====
+if (entity === 'activity' && (action === 'create' || action === 'update')) {
+if (!data?.id) return res.status(200).send('No activity');
+if (data.done === true || data.done === 1) return res.status(200).send('OK');
+if (!isActivityFresh(data)) return res.status(200).send('OK');
+if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) return res.status(200).send('OK');
+
+
+const activityRes = await fetch(`https://api.pipedrive.com/v1/activities/${data.id}?api_token=${PIPEDRIVE_API_TOKEN}`);
+const activityJson = await activityRes.json();
+if (!activityJson?.success || !activityJson.data) return res.status(200).send('No activity data');
+const activity = activityJson.data;
+
+
+let deal = null;
+if (activity.deal_id) {
+const dealRes = await fetch(`https://api.pipedrive.com/v1/deals/${activity.deal_id}?api_token=${PIPEDRIVE_API_TOKEN}`);
+const dealJson = await dealRes.json();
+if (dealJson?.success && dealJson.data) deal = dealJson.data;
+}
+
+
+const subject = activity?.subject?.toLowerCase() || '';
+const dealId = activity?.deal_id || '';
+const assignee = detectAssignee({ deal, activity });
+
+
+if (dealId && subject && assignee?.teamName) {
+try {
+const channelName = `deal${dealId}`;
+const listRes = await app.client.conversations.list();
+const channel = listRes.channels.find(c => c.name === channelName);
+
+
+if (channel) {
+let prefix = 'Packing';
+if (/pickup/.test(subject)) prefix = 'Pickup';
+else if (/water|mitigation/.test(subject)) prefix = 'Water Damage';
+
+
+const topic = `${prefix} — Crew: ${assignee.teamName}`;
+await app.client.conversations.setTopic({ channel: channel.id, topic });
+console.log(`[TOPIC] Updated #${channelName} → ${topic}`);
+}
+} catch (err) {
+console.error(`[TOPIC] Error updating subject rename`, err);
+}
+}
+
+
+return res.status(200).send('OK');
+}
+
+
+return res.status(200).send('No-op');
+} catch (err) {
+console.error('[Dispatcher] Error in /pipedrive-task', err);
+return res.status(500).send('Internal Error');
+}
+});
 
       // fetch the newest activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
