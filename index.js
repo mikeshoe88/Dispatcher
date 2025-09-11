@@ -57,13 +57,22 @@ function toSubjectListEnv(name){
 const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');
 const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');
 
+function normalizeForInvoice(s=''){
+  return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
+}
+
+// Strip trailing "— Crew: Name" so we compare against the base subject
+function subjectSansCrew(subject=''){
+  return String(subject).replace(/\s*[—-]\s*Crew:\s*[-A-Za-z' ]+$/i, '').trim();
+}
 function subjectMatchesList(subject, list){
-  const n = normalizeForInvoice(subject || '');
-  return list.some(s => normalizeForInvoice(s) === n);
+  const base = normalizeForInvoice(subjectSansCrew(subject || ''));
+  return list.some(s => normalizeForInvoice(s) === base);
 }
 
 // ===== Subject renaming controls & debug =====
-const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
+// 'never' | 'when_missing' | 'always'
+const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase();
 const RENAME_FORMAT    = process.env.RENAME_FORMAT || 'append';
 const DEBUG_RENAME     = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
@@ -378,9 +387,6 @@ async function getBestLocation(deal){
 }
 
 /* ========= Invoice detection ========= */
-function normalizeForInvoice(s=''){
-  return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
-}
 function isInvoiceLike(activity){
   if (!SKIP_INVOICE_TASKS) return false;
   const subjectNorm = normalizeForInvoice(activity?.subject || '');
@@ -416,12 +422,12 @@ function normalizeCrewTag(name){
 }
 function extractCrewTag(subject){
   if (!subject) return null;
-  const m = String(subject).match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
+  const m = String(subject).match(/Crew:\s*([-A-Za-z' ]+)/i);
   return m?.[0] || null;
 }
 function extractCrewName(subject){
-  const m = String(subject || '').match(/Crew:\s*([A-Za-z][A-Za-z ]*)/i);
-  return m ? m[1].trim().toLowerCase() : null;
+  const m = String(subject || '').match(/Crew:\s*([-A-Za-z' ]+)/i);
+  return m ? m[1].trim().toLowerCase().replace(/\s+/g,' ') : null;
 }
 function normalizeName(s){ return String(s || '').trim().toLowerCase(); }
 
@@ -430,12 +436,29 @@ function buildRenamedSubject(original, assigneeName){
   if (!crewTag) return original || '';
   const subj = String(original || '').trim();
   const existing = extractCrewTag(subj);
-  if (existing) return subj.replace(/Crew:\s*[A-Za-z][A-Za-z ]*/i, crewTag);
+  if (existing) return subj.replace(/Crew:\s*([-A-Za-z' ]+)/i, crewTag);
   if (RENAME_FORMAT === 'append') return subj ? `${subj} — ${crewTag}` : crewTag;
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
-// Only PUT when needed, with loud logs
+async function pdPutSubject(activityId, newSubject, attempts=2){
+  let last;
+  for (let i=0; i<attempts; i++){
+    const resp = await fetch(
+      `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`,
+      { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
+    );
+    const ok = resp.ok;
+    const j = await resp.json().catch(()=>null);
+    last = { ok, j };
+    if (ok && j?.success) return j;
+    if (resp.status === 429 || resp.status >= 500) { await new Promise(r=>setTimeout(r, 400)); continue; }
+    break;
+  }
+  return last?.j || { success:false };
+}
+
+// Only PUT when needed, with policy gates and retry
 async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   const want = (assigneeName || '').trim();
   if (!activityId || !want) return { did:false, reason:'no-assignee' };
@@ -446,19 +469,29 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   if (DEBUG_RENAME) {
     console.log(`[RENAME] check id=${activityId} have=${haveCrew} want=${wantCrew} subj=${JSON.stringify(currentSubject)}`);
   }
+
+  // RENAME_ON_ASSIGN policy
+  if (RENAME_ON_ASSIGN === 'never') return { did:false, reason:'policy-never' };
+  if (RENAME_ON_ASSIGN === 'when_missing' && haveCrew) return { did:false, reason:'has-crew' };
+
   if (haveCrew === wantCrew) return { did:false, reason:'already-correct' };
 
   const newSubject = buildRenamedSubject(currentSubject || '', want);
   if (!newSubject || newSubject === currentSubject) return { did:false, reason:'no-op' };
 
   console.log(`[RENAME] PUT id=${activityId}: "${currentSubject}" -> "${newSubject}"`);
-  const resp = await fetch(
-    `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`,
-    { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
-  );
-  const j = await resp.json();
-  console.log(`[RENAME] PD response id=${activityId} success=${!!j?.success} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
-  return { did: !!j?.success };
+  const putJ = await pdPutSubject(activityId, newSubject, 3);
+  if (!putJ?.success) return { did:false, reason:'pd-put-failed' };
+
+  // Fresh read to collapse races
+  try {
+    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const a2j = await a2.json();
+    const subjNow = a2j?.data?.subject || newSubject;
+    return { did:true, subject:subjNow };
+  } catch {
+    return { did:true, subject:newSubject };
+  }
 }
 
 /* ========= Assignee detection (enum-only) ========= */
@@ -818,13 +851,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // === ALWAYS rename in PD (unless invoice-like / blocked type / never lists) ===
       if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
-        await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        // refresh subject for nicer Slack text
-        try {
-          const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-          const a2j = await a2.json();
-          if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
-        } catch {}
+        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        if (r?.did && r.subject) activity.subject = r.subject;
       }
 
       // === Slack posting is gated by due date ===
@@ -880,13 +908,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         try {
           if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && ass.teamName && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) {
             const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
-            if (r?.did) {
-              try {
-                const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-                const a2j = await a2.json();
-                if (a2j?.success && a2j.data) activity.subject = a2j.data.subject || activity.subject;
-              } catch {}
-            }
+            if (r?.did && r.subject) activity.subject = r.subject;
           }
         } catch (e) { /* ignore */ }
 
@@ -949,6 +971,14 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+
+      // Rename consistency during morning run too
+      try {
+        if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && assignee.teamName && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) {
+          const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+          if (r?.did && r.subject) activity.subject = r.subject;
+        }
+      } catch {}
 
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
@@ -1035,7 +1065,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     await deleteAssigneePost(aid);
 
     res.status(200).send(
-      `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
+      `<html><body style=\"font-family:Arial;padding:24px\"><h2>Work Order Complete</h2>
        <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
        ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
        <p>${ok ? 'A completion PDF and note have been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
@@ -1083,7 +1113,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     const channelIdForQr = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
     const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
+    res.setHeader('Content-Disposition', `inline; filename=\"WO_${aid}.pdf\"`);
     return res.send(pdfBuffer);
   }catch(e){
     console.error('/wo/pdf error', e);
