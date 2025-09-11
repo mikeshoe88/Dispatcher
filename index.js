@@ -528,29 +528,24 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 }
 
 /* ========= Assignee detection (enum-only) ========= */
-function readEnumId(v){
-  return (v && typeof v === 'object' && v.value != null) ? v.value : v;
-}
+function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 /**
- * Detects team for PD rename (always) and Slack posting (optional).
- * - allowDealFallback=false → use ACTIVITY team only
- * - allowDealFallback=true  → use ACTIVITY team else DEAL team
- * Always returns teamName; channelId only if a Slack mapping exists.
+ * Returns teamName for PD renames always.
+ * channelId is only set if a Slack mapping exists.
+ * allowDealFallback:
+ *   - true  → if the activity team is empty, use the deal's team
+ *   - false → use activity-only; if absent, return nulls
  */
-function detectAssignee({ deal, activity, allowDealFallback = false }) {
+function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
-  if (tid) {
-    return {
-      teamId: String(tid),
-      teamName: PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`,
-      channelId: PRODUCTION_TEAM_TO_CHANNEL[tid] || null
-    };
-  }
-  return { teamId: null, teamName: null, channelId: null };
+  const teamName  = tid ? (PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`) : null;
+  const channelId = tid ? (PRODUCTION_TEAM_TO_CHANNEL[tid] || null) : null;
+
+  return { teamId: tid ? String(tid) : null, teamName, channelId };
 }
 
 /* ========= Reassignment & completion tracking ========= */
