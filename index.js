@@ -124,34 +124,69 @@ process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection
 process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
 
 /* ========= Event dedup (webhook loops) ========= */
+// Ignore replays of the same webhook for a short window *per activity + version*
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
 
-const EVENT_CACHE = new Map();
-const EVENT_CACHE_TTL_MS = 60 * 1000; // 60s
+const EVENT_CACHE = new Map();           // key -> exp
+const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
 
-function alreadyHandledEvent(meta, activity){
-  const id  = activity?.id || meta?.id || 'n/a';
-  const ver = meta?.timestamp || meta?.time || activity?.update_time || activity?.add_time || Date.now();
-  const key = `aid:${id}|v:${ver}`;
+function makeEventKey(meta = {}, activity = {}) {
+  // Try to form a stable version fingerprint:
+  // prefer webhook timestamp/request id + PD update_time + done flag
+  const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
+  const ts   = meta?.timestamp || meta?.time || '';
+  const req  = meta?.request_id || meta?.requestId || '';
+  const upd  = activity?.update_time || '';
+  const done = activity?.done ? '1' : '0';
+  // If nothing else is present, fall back to current minute bucket to avoid storms
+  const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
+  return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
+}
+
+function alreadyHandledEvent(meta, activity) {
+  const key = makeEventKey(meta, activity);
   const now = Date.now();
   const exp = EVENT_CACHE.get(key);
   if (exp && exp > now) return true;
-  if (EVENT_CACHE.size > 1000){
-    for (const [k, t] of EVENT_CACHE){ if (t <= now) EVENT_CACHE.delete(k); }
+
+  // Periodic cleanup
+  if (EVENT_CACHE.size > 5000) {
+    for (const [k, t] of EVENT_CACHE) if (t <= now) EVENT_CACHE.delete(k);
   }
   EVENT_CACHE.set(key, now + EVENT_CACHE_TTL_MS);
   return false;
 }
 
 /* ========= Post dedup (stop double PDFs) ========= */
-const LAST_POST = new Map();                                     // aid -> timestamp
-const POST_DEDUP_MS = Number(process.env.POST_DEDUP_MS || 8000); // 8s window
+// Strong dedup: suppress reposts unless something *material* changed
+const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
+const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
 
-function shouldPostNow(aid){
+function makePostFingerprint({ activity, assigneeName, deal }) {
+  const due    = `${activity?.due_date || ''} ${activity?.due_time || ''}`;
+  const subj   = String(activity?.subject || '');
+  const who    = String(assigneeName || '');
+  const dealId = String(deal?.id || activity?.deal_id || '');
+  // If you want to include note changes, add htmlToPlainText(activity?.note||'')
+  return `${subj}||${due}||${who}||${dealId}`;
+}
+
+function shouldPostNowStrong(activity, assigneeName, deal) {
+  const id = String(activity?.id || '');
+  if (!id) return false;
+
+  const fp = makePostFingerprint({ activity, assigneeName, deal });
   const now = Date.now();
-  const last = LAST_POST.get(String(aid)) || 0;
-  if (now - last < POST_DEDUP_MS) return false;
-  LAST_POST.set(String(aid), now);
+
+  // purge expired
+  for (const [k, v] of POST_FINGERPRINT) {
+    if (!v || v.exp <= now) POST_FINGERPRINT.delete(k);
+  }
+
+  const prev = POST_FINGERPRINT.get(id);
+  if (prev && prev.fp === fp) return false; // identical → skip
+
+  POST_FINGERPRINT.set(id, { fp, exp: now + POST_FP_TTL_MS });
   return true;
 }
 
@@ -911,8 +946,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         } catch (e) { console.warn('[WO] cleanup on date-change failed', e?.message || e); }
         return res.status(200).send('OK');
       }
+if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
+  return res.status(200).send('OK');
+}
 
-      if (!shouldPostNow(activity.id)) { return res.status(200).send('OK'); }
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
@@ -1037,7 +1074,8 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
-      if (!shouldPostNow(activity.id)) continue;
+if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
+
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
