@@ -89,7 +89,7 @@ function parseChiefMap(raw=''){
 }
 const TEAM_TO_CHIEF = parseChiefMap(process.env.CREW_CHIEF_MAP || '');
 
-// 🔁 NEW: person-name based fallbacks (e.g., Kim Kay)
+// 🔁 person-name based fallbacks (e.g., Kim Kay)
 function parseNameToChannel(raw=''){
   const out = {};
   for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
@@ -314,6 +314,67 @@ function htmlToPlainText(input=''){
        .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   s = s.replace(/\n{3,}/g, '\n\n').trim();
   return s;
+}
+
+/* ========= Address helpers (Org first, then Deal custom) ========= */
+// Deal custom Address field key (from your fields dump)
+const DEAL_ADDRESS_KEY = 'd204334da759b00ceeb544837f8f0f016c9f3e5f';
+
+function _fmt(parts) {
+  return parts.map(s => String(s||'').trim()).filter(Boolean).join(', ');
+}
+function _pickOrgAddress(org = {}) {
+  if (org.address && String(org.address).trim()) return String(org.address).trim();
+  const parts = [
+    org.address_street_number,
+    org.address_route,
+    org.address_sublocality,
+    org.address_locality,
+    org.address_admin_area_level_1,
+    org.address_postal_code,
+    org.address_country
+  ];
+  const s = _fmt(parts);
+  return s || null;
+}
+async function fetchOrganization(orgRef) {
+  const orgId = (orgRef && typeof orgRef === 'object')
+    ? (orgRef.value ?? orgRef.id ?? orgRef)
+    : orgRef;
+  if (!orgId) return null;
+  try{
+    const r = await fetch(`https://api.pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const j = await r.json();
+    return (j?.success && j.data) ? j.data : null;
+  }catch{ return null; }
+}
+function _readDealCustomAddress(deal) {
+  if (!deal) return null;
+  const v = deal[DEAL_ADDRESS_KEY];
+  if (!v) return null;
+  if (typeof v === 'string') return v.trim() || null;
+  if (typeof v === 'object') {
+    // Address-type fields often store granular parts + formatted_address
+    const formatted = v.formatted_address || v.value || null;
+    if (formatted) return String(formatted).trim() || null;
+    const parts = [
+      v.subpremise, v.street_number, v.route, v.sublocality, v.locality,
+      v.admin_area_level_1, v.postal_code, v.country
+    ];
+    const s = _fmt(parts);
+    return s || null;
+  }
+  return null;
+}
+async function getBestLocation(deal){
+  if (!deal) return 'N/A';
+  // 1) Try Organization address (native)
+  const org = await fetchOrganization(deal.org_id || deal.organization || null);
+  const orgAddr = _pickOrgAddress(org || {});
+  if (orgAddr) return orgAddr;
+  // 2) Fallback to custom Deal Address field
+  const dealAddr = _readDealCustomAddress(deal);
+  return dealAddr || 'N/A';
 }
 
 /* ========= Invoice detection ========= */
@@ -618,7 +679,7 @@ async function resolveChiefSlackIds({ assigneeName, deal }){
   const key = String(assigneeName || '').trim().toLowerCase();
   // team-based mapping
   for (const id of (TEAM_TO_CHIEF[key] || [])) out.add(id);
-  // name-based mapping 🔁 NEW
+  // name-based mapping 🔁
   for (const id of (CREW_CHIEF_NAME_TO_SLACK[key] || [])) out.add(id);
 
   if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
@@ -663,7 +724,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const dealTitle = deal?.title || 'N/A';
   const serviceId = deal ? deal['5b436b45b63857305f9691910b6567351b5517bc'] : null;
   const typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-  const location = deal?.location || 'N/A';
+  const location = await getBestLocation(deal); // 🔧 NEW: address fix
 
   // Keep a copy for invitations even if we suppress duplicate posting later
   const inviteChannelId = jobChannelId || null;
@@ -774,7 +835,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (!isActivityFresh(data)) return res.status(200).send('OK');
       if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) return res.status(200).send('OK');
 
-      // fetch the newest activity (FIX: keep inside route; the stray block caused Illegal return)
+      // fetch the newest activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
@@ -797,7 +858,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const assignee = detectAssignee({ deal, activity });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify(assignee)}`);
 
-      // 🔁 Update the job channel topic to reflect crew (non-breaking; best-effort)
+      // 🔁 Update the job channel topic to reflect crew (best-effort)
       try {
         const channelName = `deal${activity.deal_id}`;
         let cursor;
@@ -820,7 +881,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         console.error(`[TOPIC] Error updating subject rename`, err?.data || err?.message || err);
       }
 
-      // rename policy (optional note without subject change for invoice-like)
+      // rename policy
       if (isBilledInvoiceSubject(activity.subject)) {
         if (assignee.teamName && ENABLE_PD_NOTE) {
           try {
@@ -868,7 +929,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const dealId = data?.id;
       if (!dealId) return res.status(200).send('No deal');
 
-      // fetch full, current deal (webhook diffs often omit custom fields)
+      // fetch full, current deal
       let deal = null;
       try {
         const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
@@ -992,6 +1053,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     res.status(500).send('error');
   }
 });
+
 /* ========= QR Complete ========= */
 expressApp.get('/wo/complete', async (req, res) => {
   try {
@@ -1025,7 +1087,7 @@ expressApp.get('/wo/complete', async (req, res) => {
             dealTitle = deal.title || 'N/A';
             const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
             typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-            location = deal.location || 'N/A';
+            location = await getBestLocation(deal); // 🔧 NEW
           }
         }
       }
@@ -1093,7 +1155,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         dealTitle = deal.title || 'N/A';
         const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
         typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-        location = deal.location || 'N/A';
+        location = await getBestLocation(deal); // 🔧 NEW
         const ass = detectAssignee({ deal, activity: data });
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
@@ -1121,4 +1183,3 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   await app.start(PORT);
   console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
-
