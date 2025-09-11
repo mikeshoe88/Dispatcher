@@ -226,7 +226,18 @@ function compareByStartTime(a, b){
 }
 
 /* ========= Dictionaries ========= */
-const SERVICE_MAP = { 27:'Water Mitigation',28:'Fire Cleanup',29:'Contents',30:'Biohazard',31:'General Cleaning',32:'Duct Cleaning' };
+const SERVICE_MAP = {
+  27: "Water Mitigation",
+  28: "Contents",
+  29: "Reconstruction",
+  37: "Contents",
+  38: "Reconstruction",
+  39: "Fire Cleanup",
+  40: "Biohazard",
+  41: "General Cleaning",
+  42: "Duct Cleaning"
+};
+
 const PRODUCTION_TEAM_MAP = {
   47: "Kings",
   48: "Johnathan",
