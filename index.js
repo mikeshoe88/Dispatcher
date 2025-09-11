@@ -677,8 +677,9 @@ function stripCrewSuffix(s=''){
 function buildSummary({ activity, deal, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
-  const serviceId = deal ? deal['5b436b45b63857305f9691910b6567351b5517bc'] : null;
-  const typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+ const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+
   const subjNoCrew = stripCrewSuffix(activity.subject || '');
 
   return [
