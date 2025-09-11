@@ -758,8 +758,9 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
-  const serviceId = deal ? deal['5b436b45b63857305f9691910b6567351b5517bc'] : null;
-  const typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+ const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+
   const location = await getBestLocation(deal); // 🔧 NEW: address fix
 
   // Keep a copy for invitations even if we suppress duplicate posting later
@@ -1125,7 +1126,8 @@ expressApp.get('/wo/complete', async (req, res) => {
             deal = dJson.data;
             dealTitle = deal.title || 'N/A';
             const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
-            typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+
             location = await getBestLocation(deal); // 🔧 NEW
           }
         }
@@ -1192,8 +1194,9 @@ expressApp.get('/wo/pdf', async (req,res)=>{
       if (dj?.success && dj.data){
         deal = dj.data;
         dealTitle = deal.title || 'N/A';
-        const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
-        typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
+        const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+
         location = await getBestLocation(deal); // 🔧 NEW
         const ass = detectAssignee({ deal, activity: data });
         assigneeName = ass.teamName || assigneeName;
