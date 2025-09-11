@@ -131,14 +131,11 @@ const EVENT_CACHE = new Map();           // key -> exp
 const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
 
 function makeEventKey(meta = {}, activity = {}) {
-  // Try to form a stable version fingerprint:
-  // prefer webhook timestamp/request id + PD update_time + done flag
   const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
   const ts   = meta?.timestamp || meta?.time || '';
   const req  = meta?.request_id || meta?.requestId || '';
   const upd  = activity?.update_time || '';
   const done = activity?.done ? '1' : '0';
-  // If nothing else is present, fall back to current minute bucket to avoid storms
   const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
   return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
 }
@@ -149,7 +146,6 @@ function alreadyHandledEvent(meta, activity) {
   const exp = EVENT_CACHE.get(key);
   if (exp && exp > now) return true;
 
-  // Periodic cleanup
   if (EVENT_CACHE.size > 5000) {
     for (const [k, t] of EVENT_CACHE) if (t <= now) EVENT_CACHE.delete(k);
   }
@@ -158,7 +154,6 @@ function alreadyHandledEvent(meta, activity) {
 }
 
 /* ========= Post dedup (stop double PDFs) ========= */
-// Strong dedup: suppress reposts unless something *material* changed
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
 
@@ -167,7 +162,6 @@ function makePostFingerprint({ activity, assigneeName, deal }) {
   const subj   = String(activity?.subject || '');
   const who    = String(assigneeName || '');
   const dealId = String(deal?.id || activity?.deal_id || '');
-  // If you want to include note changes, add htmlToPlainText(activity?.note||'')
   return `${subj}||${due}||${who}||${dealId}`;
 }
 
@@ -292,10 +286,10 @@ const PRODUCTION_TEAM_MAP = {
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
-// Deal custom Address field key
+// Deal custom Address field key (from your fields dump)
 const DEAL_ADDRESS_KEY = 'd204334da759b00ceeb544837f8f0f016c9f3e5f';
 
-// Production Team enum ID → Slack channel (optional)
+// Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
   47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09ASBE36Q7', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
   52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE', 57: 'C09B85LE544',
@@ -389,7 +383,6 @@ function _readDealCustomAddress(deal) {
   if (!v) return null;
   if (typeof v === 'string') return v.trim() || null;
   if (typeof v === 'object') {
-    // Address-type fields often store granular parts + formatted_address
     const formatted = v.formatted_address || v.value || null;
     if (formatted) return String(formatted).trim() || null;
     const parts = [
@@ -403,11 +396,9 @@ function _readDealCustomAddress(deal) {
 }
 async function getBestLocation(deal){
   if (!deal) return 'N/A';
-  // 1) Try Organization address (native)
   const org = await fetchOrganization(deal.org_id || deal.organization || null);
   const orgAddr = _pickOrgAddress(org || {});
   if (orgAddr) return orgAddr;
-  // 2) Fallback to custom Deal Address field
   const dealAddr = _readDealCustomAddress(deal);
   return dealAddr || 'N/A';
 }
@@ -470,10 +461,18 @@ function buildRenamedSubject(original, assigneeName){
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
-// Only PUT when needed, with loud logs
+// Per-activity rename lock to avoid ping-pong on rapid updates
+const RENAME_LOCK = new Map(); // aid -> until (ms)
+const RENAME_COOLDOWN_MS = 5_000;
+
 async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   const want = (assigneeName || '').trim();
   if (!activityId || !want) return { did:false, reason:'no-assignee' };
+
+  // lock window
+  const now = Date.now();
+  const until = RENAME_LOCK.get(activityId);
+  if (until && until > now) return { did:false, reason:'cooldown' };
 
   const haveCrew = extractCrewName(currentSubject);
   const wantCrew = normalizeName(want);
@@ -492,8 +491,10 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
     { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject }) }
   );
   const j = await resp.json();
-  console.log(`[RENAME] PD response id=${activityId} success=${!!j?.success} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
-  return { did: !!j?.success };
+  const ok = !!j?.success;
+  if (ok) RENAME_LOCK.set(activityId, now + RENAME_COOLDOWN_MS);
+  console.log(`[RENAME] PD response id=${activityId} success=${ok} subject=${JSON.stringify(j?.data?.subject || newSubject)}`);
+  return { did: ok };
 }
 
 /* ========= Channel resolution ========= */
@@ -535,29 +536,37 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
   return allowDefault ? DEFAULT_CHANNEL : null;
 }
 
-/* ========= Assignee detection (enum-only) ========= */
+/* ========= Assignee detection ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 /**
- * New behavior:
- *  - Always return teamName if the Production Team enum exists on the activity or (optionally) the deal.
- *  - Only set channelId if a Slack mapping exists. (Slack is optional for PD renames.)
+ * PD rename decision: ACTIVITY-ONLY (no deal fallback)
+ *   - returns {teamId, teamName} for renaming guarantees
  */
-function detectAssignee({ deal, activity, allowDealFallback = true }) {
+function detectAssigneeForRename({ activity }) {
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  const dTid = (!aTid && allowDealFallback && deal)
-    ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY])
-    : null;
+  const tid  = aTid || null;
+  if (!tid) return { teamId: null, teamName: null };
+  return { teamId: String(tid), teamName: PRODUCTION_TEAM_MAP[tid] || `Team ${tid}` };
+}
+
+/**
+ * Slack delivery decision: allow deal fallback (to keep WO delivery working)
+ *   - returns {teamId, teamName, channelId} where channelId is only set if mapping exists
+ */
+function detectAssigneeForSlack({ deal, activity, allowDealFallback = true }) {
+  const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
-  if (tid) {
+  if (tid && PRODUCTION_TEAM_TO_CHANNEL[tid]) {
     return {
       teamId: String(tid),
       teamName: PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`,
-      channelId: PRODUCTION_TEAM_TO_CHANNEL[tid] || null // optional
+      channelId: PRODUCTION_TEAM_TO_CHANNEL[tid]
     };
   }
-  return { teamId: null, teamName: null, channelId: null };
+  return { teamId: tid ? String(tid) : null, teamName: tid ? (PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`) : null, channelId: null };
 }
 
 /* ========= Reassignment & completion tracking ========= */
@@ -717,9 +726,7 @@ async function inviteUsersToChannel(channelId, userIds=[]){
 async function resolveChiefSlackIds({ assigneeName, deal }){
   const out = new Set();
   const key = String(assigneeName || '').trim().toLowerCase();
-  // team-based mapping
   for (const id of (TEAM_TO_CHIEF[key] || [])) out.add(id);
-  // name-based mapping 🔁
   for (const id of (CREW_CHIEF_NAME_TO_SLACK[key] || [])) out.add(id);
 
   if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
@@ -764,7 +771,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const dealTitle = deal?.title || 'N/A';
   const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
   const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-  const location = await getBestLocation(deal); // address fix
+  const location = await getBestLocation(deal);
 
   // Keep a copy for invitations even if we suppress duplicate posting later
   const inviteChannelId = jobChannelId || null;
@@ -892,13 +899,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
       if (deal && !isDealActive(deal)) { return res.status(200).send('OK'); }
 
-      // resolve channels/assignee
+      // ⚙️ Rename target = ACTIVITY ONLY
+      const assigneeRename = detectAssigneeForRename({ activity });
+      console.log(`[ASSIGNEE/RENAME] id=${activity.id} -> ${JSON.stringify(assigneeRename)}`);
+
+      // 📦 Slack delivery target = allow deal fallback
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
-      const assignee = detectAssignee({ deal, activity });
-      console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify(assignee)}`);
+      const assigneeSlack  = detectAssigneeForSlack({ deal, activity, allowDealFallback: true });
+      console.log(`[ASSIGNEE/SLACK] id=${activity.id} -> ${JSON.stringify(assigneeSlack)}`);
 
-      // 🔁 Update the job channel topic to reflect crew (best-effort)
+      // 🔁 (Optional) topic update kept but harmless if not found
       try {
         const channelName = `deal${activity.deal_id}`;
         let cursor;
@@ -908,12 +919,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           target = (listRes.channels || []).find(c => c.name === channelName) || target;
           cursor = listRes?.response_metadata?.next_cursor;
         } while (!target && cursor);
-        if (target && assignee?.teamName) {
+        if (target && assigneeRename?.teamName) {
           let prefix = 'Packing';
           const subject = (activity.subject || '').toLowerCase();
           if (/pickup/.test(subject)) prefix = 'Pickup';
           else if (/water|mitigation/.test(subject)) prefix = 'Water Damage';
-          const topic = `${prefix} — Crew: ${assignee.teamName}`;
+          const topic = `${prefix} — Crew: ${assigneeRename.teamName}`;
           await app.client.conversations.setTopic({ channel: target.id, topic });
           console.log(`[TOPIC] Updated #${channelName} → ${topic}`);
         }
@@ -921,19 +932,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         console.error(`[TOPIC] Error updating subject rename`, err?.data || err?.message || err);
       }
 
-      // rename policy
-      if (isBilledInvoiceSubject(activity.subject)) {
-        if (assignee.teamName && ENABLE_PD_NOTE) {
-          try {
-            await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`,{
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({ content:`🧾 Crew assignment update (no subject change): ${assignee.teamName}`, pinned_to_activity_id: String(activity.id) })
-            });
-          } catch(e){ console.warn('[WO] logCrewHistoryNote failed', activity.id, e?.message||e); }
-        }
-      } else if (assignee.teamName && isTypeAllowedForRename(activity) && !isInvoiceLike(activity)) {
-        await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        // refresh subject for nicer Slack text
+      // ✅ Rename policy (ACTIVITY ONLY; no deal fallback, no invoice-like)
+      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && assigneeRename.teamName) {
+        await ensureCrewTagMatches(activity.id, activity.subject || '', assigneeRename.teamName);
+        // refresh subject locally for Slack text
         try {
           const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
           const a2j = await a2.json();
@@ -951,14 +953,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         } catch (e) { console.warn('[WO] cleanup on date-change failed', e?.message || e); }
         return res.status(200).send('OK');
       }
-      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
+
+      if (!shouldPostNowStrong(activity, assigneeSlack.teamName, deal)) {
         return res.status(200).send('OK');
       }
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
-        assigneeChannelId: assignee.channelId,
-        assigneeName: assignee.teamName,
+        assigneeChannelId: assigneeSlack.channelId,
+        assigneeName: assigneeSlack.teamName,
         noteText: activity.note
       });
 
@@ -993,15 +996,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
 
       for (const activity of items) {
-        // Recompute assignee per-activity (activity enum overrides deal enum)
-        const ass = detectAssignee({ deal, activity });
+        // 🚫 No forced rename on deal updates unless activity already has its own team
+        const assRename = detectAssigneeForRename({ activity });
+        // Slack delivery can still fallback
+        const assSlack  = detectAssigneeForSlack({ deal, activity, allowDealFallback: true });
 
-        // ✏️ Always try to rename on deal updates (unless invoice-like / blocked type)
         try {
-          if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && ass.teamName) {
-            const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
+          if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && assRename.teamName) {
+            const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assRename.teamName);
             if (r?.did) {
-              // refresh local subject so Slack text shows the new crew
               try {
                 const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activity.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
                 const a2j = await a2.json();
@@ -1010,12 +1013,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             }
           }
         } catch (e) {
-          console.warn('[WO] rename on DEAL update failed', activity.id, e?.message || e);
+          console.warn('[WO] rename on DEAL update skipped/failed', activity.id, e?.message || e);
         }
 
         // Posting behavior: only post if due today (or POST_FUTURE_WOS)
         if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          // Clean up any prior assignee/job-channel post if date bumped out of today
           try {
             await deleteAssigneePost(activity.id);
             const jobCh = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
@@ -1024,13 +1026,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           continue;
         }
 
-        // ✅ strong dedup uses teamName (Slack optional)
-        if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
+        if (!shouldPostNowStrong(activity, assSlack.teamName, deal)) continue;
 
         await postWorkOrderToChannels({
           activity, deal, jobChannelId,
-          assigneeChannelId: ass.channelId,
-          assigneeName: ass.teamName,
+          assigneeChannelId: assSlack.channelId,
+          assigneeName: assSlack.teamName,
           noteText: activity.note
         });
       }
@@ -1077,14 +1078,21 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       let jobChannelId = await resolveDealChannelId({ dealId: activity.deal_id, allowDefault: ALLOW_DEFAULT_FALLBACK });
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
-      const assignee = detectAssignee({ deal, activity });
 
-      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
+      const assigneeRename = detectAssigneeForRename({ activity });
+      const assigneeSlack  = detectAssigneeForSlack({ deal, activity, allowDealFallback: true });
+
+      // optional safety: keep subject aligned if activity has team
+      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && assigneeRename.teamName) {
+        await ensureCrewTagMatches(activity.id, activity.subject || '', assigneeRename.teamName);
+      }
+
+      if (!shouldPostNowStrong(activity, assigneeSlack.teamName, deal)) continue;
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
-        assigneeChannelId: assignee.channelId,
-        assigneeName: assignee.teamName,
+        assigneeChannelId: assigneeSlack.channelId,
+        assigneeName: assigneeSlack.teamName,
         noteText: activity.note
       });
       posted++;
@@ -1129,7 +1137,7 @@ expressApp.get('/wo/complete', async (req, res) => {
             dealTitle = deal.title || 'N/A';
             const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
             typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-            location = await getBestLocation(deal); // address fix
+            location = await getBestLocation(deal);
           }
         }
       }
@@ -1197,7 +1205,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         dealTitle = deal.title || 'N/A';
         const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
         typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-        location = await getBestLocation(deal); // address fix
+        location = await getBestLocation(deal);
         const ass = detectAssignee({ deal, activity: data });
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
