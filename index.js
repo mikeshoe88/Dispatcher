@@ -131,14 +131,11 @@ const EVENT_CACHE = new Map();           // key -> exp
 const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
 
 function makeEventKey(meta = {}, activity = {}) {
-  // Try to form a stable version fingerprint:
-  // prefer webhook timestamp/request id + PD update_time + done flag
   const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
   const ts   = meta?.timestamp || meta?.time || '';
   const req  = meta?.request_id || meta?.requestId || '';
   const upd  = activity?.update_time || '';
   const done = activity?.done ? '1' : '0';
-  // If nothing else is present, fall back to current minute bucket to avoid storms
   const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
   return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
 }
@@ -167,7 +164,6 @@ function makePostFingerprint({ activity, assigneeName, deal }) {
   const subj   = String(activity?.subject || '');
   const who    = String(assigneeName || '');
   const dealId = String(deal?.id || activity?.deal_id || '');
-  // If you want to include note changes, add htmlToPlainText(activity?.note||'')
   return `${subj}||${due}||${who}||${dealId}`;
 }
 
@@ -292,6 +288,9 @@ const PRODUCTION_TEAM_MAP = {
 
 // PD custom field key (Production Team on DEAL/ACTIVITY)
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
+// Deal custom Address field key
+const DEAL_ADDRESS_KEY = 'd204334da759b00ceeb544837f8f0f016c9f3e5f';
+
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
   47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09ASBE36Q7', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
@@ -352,9 +351,6 @@ function htmlToPlainText(input=''){
 }
 
 /* ========= Address helpers (Org first, then Deal custom) ========= */
-// Deal custom Address field key (from your fields dump)
-const DEAL_ADDRESS_KEY = 'd204334da759b00ceeb544837f8f0f016c9f3e5f';
-
 function _fmt(parts) {
   return parts.map(s => String(s||'').trim()).filter(Boolean).join(', ');
 }
@@ -389,7 +385,6 @@ function _readDealCustomAddress(deal) {
   if (!v) return null;
   if (typeof v === 'string') return v.trim() || null;
   if (typeof v === 'object') {
-    // Address-type fields often store granular parts + formatted_address
     const formatted = v.formatted_address || v.value || null;
     if (formatted) return String(formatted).trim() || null;
     const parts = [
@@ -403,11 +398,9 @@ function _readDealCustomAddress(deal) {
 }
 async function getBestLocation(deal){
   if (!deal) return 'N/A';
-  // 1) Try Organization address (native)
   const org = await fetchOrganization(deal.org_id || deal.organization || null);
   const orgAddr = _pickOrgAddress(org || {});
   if (orgAddr) return orgAddr;
-  // 2) Fallback to custom Deal Address field
   const dealAddr = _readDealCustomAddress(deal);
   return dealAddr || 'N/A';
 }
@@ -538,7 +531,6 @@ async function resolveDealChannelId({ dealId, allowDefault = ALLOW_DEFAULT_FALLB
 /* ========= Assignee detection (enum-only) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 function detectAssignee({ deal, activity }) {
-  // ONLY use the Production Team enum (activity first, then deal)
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const dTid = !aTid && deal ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
@@ -550,8 +542,6 @@ function detectAssignee({ deal, activity }) {
       channelId: PRODUCTION_TEAM_TO_CHANNEL[tid]
     };
   }
-
-  // No fallbacks
   return { teamId: null, teamName: null, channelId: null };
 }
 
@@ -605,7 +595,6 @@ async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, loc
   doc.moveDown(0.5);
   doc.image(qrBuffer, { fit: [120, 120] });
 
-  // (No raw URL printed)
   doc.end();
   return done;
 }
@@ -677,9 +666,8 @@ function stripCrewSuffix(s=''){
 function buildSummary({ activity, deal, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
- const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
-const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-
+  const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+  const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
   const subjNoCrew = stripCrewSuffix(activity.subject || '');
 
   return [
@@ -758,10 +746,9 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
- const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
-const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-
-  const location = await getBestLocation(deal); // 🔧 NEW: address fix
+  const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+  const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+  const location = await getBestLocation(deal);
 
   // Keep a copy for invitations even if we suppress duplicate posting later
   const inviteChannelId = jobChannelId || null;
@@ -948,10 +935,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         } catch (e) { console.warn('[WO] cleanup on date-change failed', e?.message || e); }
         return res.status(200).send('OK');
       }
-if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
-  return res.status(200).send('OK');
-}
-
+      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
+        return res.status(200).send('OK');
+      }
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
@@ -1022,7 +1008,8 @@ if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
           continue;
         }
 
-        if (!shouldPostNow(activity.id)) continue;
+        // ✅ use strong dedup here
+        if (!shouldPostNowStrong(activity, ass.channelId ? ass.teamName : null, deal)) continue;
 
         await postWorkOrderToChannels({
           activity, deal, jobChannelId,
@@ -1076,8 +1063,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       if (FORCE_CHANNEL_ID) jobChannelId = FORCE_CHANNEL_ID;
       const assignee = detectAssignee({ deal, activity });
 
-if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
-
+      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
@@ -1125,10 +1111,9 @@ expressApp.get('/wo/complete', async (req, res) => {
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
             dealTitle = deal.title || 'N/A';
-            const serviceId = deal['5b436b45b63857305f9691910b6567351b5517bc'];
-typeOfService = SERVICE_MAP[serviceId] || serviceId || 'N/A';
-
-            location = await getBestLocation(deal); // 🔧 NEW
+            const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+            typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+            location = await getBestLocation(deal);
           }
         }
       }
@@ -1195,9 +1180,8 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         deal = dj.data;
         dealTitle = deal.title || 'N/A';
         const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
-typeOfService = SERVICE_MAP[serviceId] || 'N/A';
-
-        location = await getBestLocation(deal); // 🔧 NEW
+        typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+        location = await getBestLocation(deal);
         const ass = detectAssignee({ deal, activity: data });
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
