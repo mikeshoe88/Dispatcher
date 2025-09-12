@@ -494,11 +494,27 @@ const TEAM_NAME_SET = new Set(
  * Returns { teamId, teamName, channelId }
  */
 function detectAssignee({ deal, activity, allowDealFallback = true }) {
+  const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
+  const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
+
   // 1) Activity-level enum
-  const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  // 2) Deal-level enum (if allowed)
-  const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  const tid  = aTid || dTid || null;
+  const aTid = (ACTIVITY_TEAM_KEY && activity)
+    ? readEnumId(activity[ACTIVITY_TEAM_KEY])
+    : null;
+
+  // 2) Deal-level enum (fallback)
+  const dTid = (!aTid && allowDealFallback && deal && DEAL_TEAM_KEY)
+    ? readEnumId(deal[DEAL_TEAM_KEY])
+    : null;
+
+  const tid = aTid || dTid || null;
+
+  if (RENAME_DEBUG_LEVEL) {
+    dbgRename('assign-source', {
+      aid: activity?.id, aTid, dTid,
+      used: tid, owner: activity?.owner_name || null
+    });
+  }
 
   if (tid) {
     const teamName  = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
@@ -518,7 +534,6 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
     null;
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
-
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
     return { teamId: null, teamName: ownerName, channelId: null };
   }
@@ -526,21 +541,6 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   return { teamId: null, teamName: null, channelId: null };
 }
 
-/* ========= Minimal channel resolution ========= */
-async function resolveDealChannelId({ allowDefault = ALLOW_DEFAULT_FALLBACK }){
-  if (FORCE_CHANNEL_ID) return FORCE_CHANNEL_ID;
-  return allowDefault ? DEFAULT_CHANNEL : null;
-}
-
-async function ensureBotInChannel(channelId){
-  if (!channelId) return;
-  try { await app.client.conversations.join({ channel: channelId }); }
-  catch (e) { /* ignore join errors */ }
-}
-
-/* ========= Reassignment & completion tracking ========= */
-const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
-const AID_TAG = (id)=>`[AID:${id}]`;
 
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
@@ -740,21 +740,32 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   }
 
   let customerName = null;
-try {
-  const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
-  if (pid) {
-    const pres = await fetch(
-      `https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
-    );
-    const pjson = await pres.json();
-    if (pjson?.success && pjson.data) {
-      customerName = pjson.data.name || null;
+  try {
+    const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
+    if (pid) {
+      const pres = await fetch(
+        `https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      );
+      const pjson = await pres.json();
+      if (pjson?.success && pjson.data) {
+        customerName = pjson.data.name || null;
+      }
     }
+  } catch (e) {
+    console.warn('[WO] person fetch failed', e?.message || e);
   }
-} catch (e) {
-  console.warn('[WO] person fetch failed', e?.message || e);
-}
 
+  // ✅ Create the PDF buffer BEFORE any uploads
+  const pdfBuffer = await buildWorkOrderPdfBuffer({
+    activity,
+    dealTitle,
+    typeOfService,
+    location,
+    channelForQR: (jobChannelId || assigneeChannelId || DEFAULT_CHANNEL),
+    assigneeName,
+    customerName,
+    jobNumber: deal?.id
+  });
 
   const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
@@ -886,28 +897,27 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       dbgRename('assignee', assignee);
 
       // ===== RENAME GATE =====
-{
-  const typeAllowed = isTypeAllowedForRename(activity);
-  const hasTeam     = !!assignee.teamName;
+      {
+        const typeAllowed = isTypeAllowedForRename(activity);
+        const hasTeam     = !!assignee.teamName;
 
-  if (typeAllowed && hasTeam) {
-    const r = await ensureCrewTagMatches(
-      activity.id,
-      activity.subject || '',
-      assignee.teamName
-    );
-    if (r?.did && r.subject) activity.subject = r.subject;
-  } else {
-    dbgRename('rename-skipped', {
-      aid: activity.id,
-      type: activity.type,
-      subject: activity.subject,
-      typeAllowed,
-      hasTeam
-    });
-  }
-}
-
+        if (typeAllowed && hasTeam) {
+          const r = await ensureCrewTagMatches(
+            activity.id,
+            activity.subject || '',
+            assignee.teamName
+          );
+          if (r?.did && r.subject) activity.subject = r.subject;
+        } else {
+          dbgRename('rename-skipped', {
+            aid: activity.id,
+            type: activity.type,
+            subject: activity.subject,
+            typeAllowed,
+            hasTeam
+          });
+        }
+      }
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
