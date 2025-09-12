@@ -1097,7 +1097,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     await deleteAssigneePost(aid);
 
     res.status(200).send(
-      `<html><body style=\"font-family:Arial;padding:24px\"><h2>Work Order Complete</h2>
+      `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
        <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
        ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
        <p>${ok ? 'A completion PDF and note have been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
@@ -1145,7 +1145,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     const channelIdForQr = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
     const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename=\"WO_${aid}.pdf\"`);
+    res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
     return res.send(pdfBuffer);
   }catch(e){
     console.error('/wo/pdf error', e);
@@ -1158,3 +1158,4 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   await app.start(PORT);
   console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
+
