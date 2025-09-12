@@ -517,12 +517,29 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
-  // If we have an enum id, we can map cleanly.
   if (tid) {
     const teamName  = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
     const channelId = PRODUCTION_TEAM_TO_CHANNEL[tid] || null;
     return { teamId: String(tid), teamName, channelId };
   }
+
+  // 3) Fallback: infer from activity owner / assigned user
+  const userObj = (typeof activity?.user_id === 'object' ? activity.user_id : null)
+               || (typeof activity?.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null)
+               || null;
+
+  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_name || null;
+  const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
+
+  if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
+    return { teamId: null, teamName: ownerName, channelId: null };
+  }
+
+  return { teamId: null, teamName: null, channelId: null };
+}
+
+// (no top-level console.log here)
+
 
   // 3) Fallback: infer from activity owner / assigned user
   // Pipedrive activity typically has `user_id` (object or id) and sometimes `assigned_to_user_id`.
@@ -543,8 +560,6 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   // Nothing detected
   return { teamId: null, teamName: null, channelId: null };
 }
-
-console.log(`[ASSIGNEE/ACT] id=${activity.id} owner_name=${activity?.owner_name || 'n/a'} user_id=${JSON.stringify(activity?.user_id || null)}`);
 
 
 /* ========= Minimal channel resolution ========= */
