@@ -740,20 +740,21 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   }
 
   let customerName = null;
-  try {
-    const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
-    if (pid) {
-      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const pjson = await res.json();
-      if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
+try {
+  const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
+  if (pid) {
+    const pres = await fetch(
+      `https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+    );
+    const pjson = await pres.json();
+    if (pjson?.success && pjson.data) {
+      customerName = pjson.data.name || null;
     }
-  } catch {}
+  }
+} catch (e) {
+  console.warn('[WO] person fetch failed', e?.message || e);
+}
 
-  const pdfBuffer = await buildWorkOrderPdfBuffer({
-    activity, dealTitle, typeOfService, location,
-    channelForQR: (jobChannelId || assigneeChannelId || DEFAULT_CHANNEL), assigneeName,
-    customerName, jobNumber: deal?.id
-  });
 
   const safe = (s) => (s || '').toString().replace(/[^\w\-]+/g,'_').slice(0,60);
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
@@ -885,16 +886,28 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       dbgRename('assignee', assignee);
 
       // ===== RENAME GATE =====
-      if (isTypeAllowedForRename(activity) && assignee.teamName) {
-        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        if (r?.did && r.subject) activity.subject = r.subject;
-      } else {
-        dbgRename('rename-skipped', {
-          typeAllowed: isTypeAllowedForRename(activity),
-          inNeverList: false,
-          hasTeamName: !!assignee.teamName
-        });
-      }
+{
+  const typeAllowed = isTypeAllowedForRename(activity);
+  const hasTeam     = !!assignee.teamName;
+
+  if (typeAllowed && hasTeam) {
+    const r = await ensureCrewTagMatches(
+      activity.id,
+      activity.subject || '',
+      assignee.teamName
+    );
+    if (r?.did && r.subject) activity.subject = r.subject;
+  } else {
+    dbgRename('rename-skipped', {
+      aid: activity.id,
+      type: activity.type,
+      subject: activity.subject,
+      typeAllowed,
+      hasTeam
+    });
+  }
+}
+
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
