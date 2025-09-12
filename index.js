@@ -86,7 +86,7 @@ const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAM
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
 
-// ===== Crew chief auto-invite (optional) =====
+/* ===== Crew chief auto-invite (optional) ===== */
 const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
 const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
 function parseChiefMap(raw=''){
@@ -287,6 +287,11 @@ const PRODUCTION_TEAM_TO_CHANNEL = {
   58: 'C09EQNJN960', 59: null, 60: null
 };
 
+// 🔁 Name → ID map (to resolve label-only enum values)
+const TEAM_NAME_TO_ID = Object.fromEntries(
+  Object.entries(PRODUCTION_TEAM_MAP).map(([id, name]) => [String(name).trim().toLowerCase(), Number(id)])
+);
+
 /* ========= Minimal channel resolution ========= */
 async function resolveDealChannelId({ allowDefault = ALLOW_DEFAULT_FALLBACK } = {}) {
   if (FORCE_CHANNEL_ID) return FORCE_CHANNEL_ID;
@@ -484,7 +489,7 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
 
   // Fresh read to collapse races
   try {
-    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const a2j = await a2.json();
     const subjNow = a2j?.data?.subject || newSubject;
     return { did:true, subject:subjNow };
@@ -493,34 +498,48 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   }
 }
 
-// ========= Assignee detection (enum + fallbacks) =========
+/* ========= Assignee detection (enum + fallbacks) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 const TEAM_NAME_SET = new Set(
   Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
 );
 
-/**
- * Probe the activity for any 40-hex custom field whose value matches a Production Team enum.
- * Returns { id, key } or null.
- */
+// Probe all custom fields on the activity to find a Production Team enum by id or label
 function probeActivityTeamId(activity){
   if (!activity) return null;
   const VALID = new Set(Object.keys(PRODUCTION_TEAM_MAP).map(n => Number(n)));
+  const norm = (s)=>String(s||'').trim().toLowerCase();
+
   for (const [key, val] of Object.entries(activity)){
-    if (!/^[a-f0-9]{40}$/i.test(key)) continue; // PD custom field shape
-    let v = null;
-    if (val && typeof val === 'object' && 'value' in val) v = Number(val.value);
-    else if (typeof val === 'number') v = val;
-    else if (typeof val === 'string' && /^\d+$/.test(val)) v = Number(val);
-    if (v != null && VALID.has(v)) return { id: v, key };
+    if (!/^[a-f0-9]{40}$/i.test(key)) continue; // PD custom-field keys look like 40-hex
+    let id = null;
+
+    if (val && typeof val === 'object') {
+      if ('value' in val) {
+        if (typeof val.value === 'number') id = val.value;
+        else if (typeof val.value === 'string') id = TEAM_NAME_TO_ID[norm(val.value)] ?? null;
+      }
+      if (id == null && 'label' in val && typeof val.label === 'string') {
+        id = TEAM_NAME_TO_ID[norm(val.label)] ?? null;
+      }
+    } else if (typeof val === 'number') {
+      id = val;
+    } else if (typeof val === 'string') {
+      id = /^\d+$/.test(val) ? Number(val) : (TEAM_NAME_TO_ID[norm(val)] ?? null);
+    }
+
+    if (id != null && VALID.has(id)) {
+      dbgRename('activity-probe', { aid: activity?.id, keyUsed: key, resolvedId: String(id) });
+      return { id, key };
+    }
   }
   return null;
 }
 
 /**
  * Detects assignee/crew in this order:
- *   1) Activity-level Production Team enum (explicit keys, then probe)
+ *   1) Activity-level Production Team enum (env key → deal key on activity → probe)
  *   2) Deal-level Production Team enum
  *   3) Activity owner / assigned user name
  *
@@ -530,36 +549,57 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
   const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
 
-  // 1) Activity-level — try explicit key, then deal key (some reuse), then probe
+  const normalizeToId = (v)=>{
+    const raw = readEnumId(v);
+    if (raw != null) {
+      if (typeof raw === 'number') return raw;
+      if (typeof raw === 'string') return /^\d+$/.test(raw) ? Number(raw) : (TEAM_NAME_TO_ID[raw.trim().toLowerCase()] ?? null);
+    }
+    if (v && typeof v === 'object' && typeof v.label === 'string') {
+      const hit = TEAM_NAME_TO_ID[v.label.trim().toLowerCase()];
+      if (hit != null) return hit;
+    }
+    if (typeof v === 'string') {
+      return /^\d+$/.test(v) ? Number(v) : (TEAM_NAME_TO_ID[v.trim().toLowerCase()] ?? null);
+    }
+    return null;
+  };
+
+  // 1) Activity-level enum (explicit key → deal key on activity → probe)
   let aTid = null, aKeyUsed = null;
-  for (const k of [ACTIVITY_TEAM_KEY, DEAL_TEAM_KEY].filter(Boolean)) {
-    const id = activity ? readEnumId(activity[k]) : null;
-    if (id) { aTid = id; aKeyUsed = k; break; }
+
+  if (ACTIVITY_TEAM_KEY && activity) {
+    const id = normalizeToId(activity[ACTIVITY_TEAM_KEY]);
+    if (id != null) { aTid = id; aKeyUsed = ACTIVITY_TEAM_KEY; }
   }
-  if (!aTid) {
-    const probed = probeActivityTeamId(activity);
-    if (probed) { aTid = probed.id; aKeyUsed = probed.key; }
+  if (aTid == null && DEAL_TEAM_KEY && activity) {
+    const id = normalizeToId(activity[DEAL_TEAM_KEY]);
+    if (id != null) { aTid = id; aKeyUsed = DEAL_TEAM_KEY; }
   }
-  if (aTid) {
+  if (aTid == null) {
+    const p = probeActivityTeamId(activity);
+    if (p) { aTid = p.id; aKeyUsed = p.key; }
+  }
+  if (aTid != null) {
     const teamName  = PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`;
     const channelId = PRODUCTION_TEAM_TO_CHANNEL[aTid] || null;
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:String(aTid), aKeyUsed, dTid:null, used:String(aTid), owner:activity?.owner_name||null, source:'activity' });
-    return { teamId:String(aTid), teamName, channelId, _source:'activity' };
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:String(aTid), aKeyUsed, dTid:null, used:String(aTid), owner: activity?.owner_name || null, source:'activity' });
+    return { teamId: String(aTid), teamName, channelId, _source:'activity' };
   }
 
-  // 2) Deal-level fallback
+  // 2) Deal-level
   let dTid = null;
   if (allowDealFallback && deal && DEAL_TEAM_KEY) {
-    dTid = readEnumId(deal[DEAL_TEAM_KEY]) || null;
-    if (dTid) {
+    dTid = normalizeToId(deal[DEAL_TEAM_KEY]) ?? null;
+    if (dTid != null) {
       const teamName  = PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`;
       const channelId = PRODUCTION_TEAM_TO_CHANNEL[dTid] || null;
-      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:String(dTid), used:String(dTid), owner:activity?.owner_name||null, source:'deal' });
-      return { teamId:String(dTid), teamName, channelId, _source:'deal' };
+      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: String(dTid), used: String(dTid), owner: activity?.owner_name || null, source:'deal' });
+      return { teamId: String(dTid), teamName, channelId, _source:'deal' };
     }
   }
 
-  // 3) Owner fallback
+  // 3) Fallback: infer from activity owner / assigned user
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -572,14 +612,13 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:null, used:ownerName, owner:ownerName, source:'owner' });
-    return { teamId:null, teamName:ownerName, channelId:null, _source:'owner' };
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: null, used: ownerName, owner: ownerName, source:'owner' });
+    return { teamId: null, teamName: ownerName, channelId: null, _source:'owner' };
   }
 
-  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:null, used:null, owner:activity?.owner_name||null, source:'none' });
-  return { teamId:null, teamName:null, channelId:null, _source:'none' };
+  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: null, used: null, owner: activity?.owner_name || null, source:'none' });
+  return { teamId: null, teamName: null, channelId: null, _source:'none' };
 }
-
 
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
@@ -783,7 +822,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
       const pres = await fetch(
-        `https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const pjson = await pres.json();
       if (pjson?.success && pjson.data) {
@@ -867,7 +906,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
   try {
     if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
       res.status(403).send('Forbidden');
-      return; // avoid 'illegal return' at module top when bundlers misparse
+      return;
     }
 
     const meta = req.body?.meta || {};
@@ -899,9 +938,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         return;
       }
 
-      // fetch the latest activity
+      // fetch the latest activity (include return_field_key to get raw keys)
       const aRes = await fetch(
-        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
@@ -926,7 +965,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
       if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
 
-      // resolve assignee: STRICT activity enum → (optional) deal enum fallback
+      // resolve assignee: prefer activity enum → (optional) deal enum fallback
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(
         `[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
@@ -989,7 +1028,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -997,9 +1036,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
       deal = deal || data;
 
-      // list all OPEN activities on this deal
+      // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1067,7 +1106,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const listRes = await fetch(`https://api/pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
@@ -1077,7 +1116,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     for (const activity of dueToday) {
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1131,13 +1170,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1167,7 +1206,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
+      await fetch(`https://api/pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
@@ -1195,7 +1234,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1204,7 +1243,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1216,7 +1255,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
