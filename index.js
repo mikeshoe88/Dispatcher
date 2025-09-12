@@ -882,19 +882,18 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       );
       dbgRename('assignee', assignee);
 
-      // ===== RENAME GATE =====
-      if (isTypeAllowedForRename(activity) &&
-          !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
-          assignee.teamName) {
-        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        if (r?.did && r.subject) activity.subject = r.subject;
-      } else {
-        dbgRename('rename-skipped', {
-          typeAllowed: isTypeAllowedForRename(activity),
-          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-          hasTeamName: !!assignee.teamName
-        });
-      }
+     // ===== RENAME GATE =====
+if (isTypeAllowedForRename(activity) && assignee.teamName) {
+  const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+  if (r?.did && r.subject) activity.subject = r.subject;
+} else {
+  dbgRename('rename-skipped', {
+    typeAllowed: isTypeAllowedForRename(activity),
+    inNeverList: false, // removed never-list gate
+    hasTeamName: !!assignee.teamName
+  });
+}
+
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
@@ -945,21 +944,20 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const ass = detectAssignee({ deal, activity, allowDealFallback: true });
 
         // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
-        try {
-          if (isTypeAllowedForRename(activity) &&
-              !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
-              ass.teamName) {
-            const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
-            if (r?.did && r.subject) activity.subject = r.subject;
-          } else {
-            dbgRename('deal-update-gates', {
-              aid: activity.id,
-              typeAllowed: isTypeAllowedForRename(activity),
-              inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-              hasTeamName: !!ass.teamName
-            });
-          }
-        } catch (e) { /* ignore */ }
+       try {
+  if (isTypeAllowedForRename(activity) && ass.teamName) {
+    const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
+    if (r?.did && r.subject) activity.subject = r.subject;
+  } else {
+    dbgRename('deal-update-gates', {
+      aid: activity.id,
+      typeAllowed: isTypeAllowedForRename(activity),
+      inNeverList: false, // removed
+      hasTeamName: !!ass.teamName
+    });
+  }
+} catch (e) { /* ignore */ }
+
 
         // Posting behavior: only due today (unless POST_FUTURE_WOS)
         if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
@@ -1021,13 +1019,12 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       // ====== SAME RENAME GATE IN 7AM RUN ======
       try {
-        if (isTypeAllowedForRename(activity) &&
-            !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
-            assignee.teamName) {
-          const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-          if (r?.did && r.subject) activity.subject = r.subject;
-        }
-      } catch {}
+  if (isTypeAllowedForRename(activity) && assignee.teamName) {
+    const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+    if (r?.did && r.subject) activity.subject = r.subject;
+  }
+} catch {}
+
 
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
