@@ -855,58 +855,77 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
-    // ===== Activity create/update =====
-    if (entity === 'activity' && (action === 'create' || action === 'update')) {
-      if (!data?.id) return res.status(200).send('No activity');
-      if (data.done === true || data.done === 1) return res.status(200).send('OK');
+// ===== Activity create/update =====
+if (entity === 'activity' && (action === 'create' || action === 'update')) {
+  if (!data?.id) return res.status(200).send('No activity');
+  if (data.done === true || data.done === 1) return res.status(200).send('OK');
 
-      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
-        dbgRename('skip-dedup', { entity, action, aid: data?.id, meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp } });
-        return res.status(200).send('OK');
-      }
+  // de-dup incoming PD webhooks
+  if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
+    dbgRename('skip-dedup', {
+      entity, action, aid: data?.id,
+      meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp }
+    });
+    return res.status(200).send('OK');
+  }
 
-      // fetch the newest activity
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const aJson = await aRes.json();
-      if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
-      const activity = aJson.data;
+  // fetch the latest activity
+  const aRes = await fetch(
+    `https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+  );
+  const aJson = await aRes.json();
+  if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
+  const activity = aJson.data;
 
-      dbgRename('activity-fetched', {
-        id: activity.id, subject: activity.subject, type: activity.type,
-        due_date: activity.due_date, due_time: activity.due_time, done: activity.done
-      });
+  dbgRename('activity-fetched', {
+    id: activity.id, subject: activity.subject, type: activity.type,
+    due_date: activity.due_date, due_time: activity.due_time, done: activity.done
+  });
 
-      if (activity.done === true || activity.done === 1) { return res.status(200).send('OK'); }
+  if (activity.done === true || activity.done === 1) return res.status(200).send('OK');
 
-      // fetch its deal (optional, for address + fallback)
-      let deal = null;
-      if (activity.deal_id) {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-        const dJson = await dRes.json();
-        if (dJson?.success && dJson.data) deal = dJson.data;
-      }
-      if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
+  // ALWAYS fetch the deal so we can fall back to the deal-level enum
+  let deal = null;
+  try {
+    if (activity.deal_id) {
+      const dRes = await fetch(
+        `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+      );
+      const dJson = await dRes.json();
+      if (dJson?.success && dJson.data) deal = dJson.data;
+    }
+  } catch {}
+  if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
 
-      if (deal && !isDealActive(deal)) { return res.status(200).send('OK'); }
+  // resolve assignee: activity enum → deal enum (fallback)
+  const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+  console.log(
+    `[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
+      teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
+    })}`
+  );
+  dbgRename('assignee', assignee);
 
-      // resolve assignee (activity first, then deal, else name fallback)
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
-      console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({teamName:assignee.teamName, teamId:assignee.teamId, channelId:!!assignee.channelId&&'yes'})}`);
-      dbgRename('assignee', assignee);
+  // ===== RENAME GATE =====
+  if (!isInvoiceLike(activity) &&
+      isTypeAllowedForRename(activity) &&
+      !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
+      assignee.teamName) {
+    const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+    if (r?.did && r.subject) activity.subject = r.subject;
+  } else {
+    dbgRename('rename-skipped', {
+      invoice: isInvoiceLike(activity),
+      typeAllowed: isTypeAllowedForRename(activity),
+      inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+      hasTeamName: !!assignee.teamName
+    });
+  }
 
-      // ====== RENAME GATE (this is the block you were looking for) ======
-      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
-          !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
-        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        if (r?.did && r.subject) activity.subject = r.subject;
-      } else {
-        dbgRename('rename-skipped', {
-          invoice: isInvoiceLike(activity),
-          typeAllowed: isTypeAllowedForRename(activity),
-          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-          hasTeamName: !!assignee.teamName
-        });
-      }
+  // (keep whatever posting/other logic you have after this point, or just end)
+  return res.status(200).send('OK');
+}
+
       // ================================================================
 
       // === Slack posting is gated by due date ===
