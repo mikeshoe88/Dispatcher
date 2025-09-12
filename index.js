@@ -493,49 +493,48 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   }
 }
 
-/* ========= Assignee detection (enum + fallbacks) ========= */
+// ========= Assignee detection (enum + fallbacks) =========
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
-// Build a quick lowercase name lookup from your PRODUCTION_TEAM_MAP values
 const TEAM_NAME_SET = new Set(
   Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
 );
 
 /**
- * Detects assignee/crew for:
- *   1) Activity-level Production Team enum (preferred)
- *   2) Deal-level Production Team enum (fallback)
- *   3) Activity owner / assigned user name (last resort)
+ * Detects assignee/crew in this order:
+ *   1) Activity-level Production Team enum (check BOTH keys)
+ *   2) Deal-level Production Team enum
+ *   3) Activity owner / assigned user name
  *
- * Returns { teamId, teamName, channelId }
+ * Returns { teamId, teamName, channelId, _source }
  */
 function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
   const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
 
-  // 1) Activity-level enum
-  const aTid = (ACTIVITY_TEAM_KEY && activity)
-    ? readEnumId(activity[ACTIVITY_TEAM_KEY])
-    : null;
-
-  // 2) Deal-level enum (fallback)
-  const dTid = (!aTid && allowDealFallback && deal && DEAL_TEAM_KEY)
-    ? readEnumId(deal[DEAL_TEAM_KEY])
-    : null;
-
-  const tid = aTid || dTid || null;
-
-  if (RENAME_DEBUG_LEVEL) {
-    dbgRename('assign-source', {
-      aid: activity?.id, aTid, dTid,
-      used: tid, owner: activity?.owner_name || null
-    });
+  // 1) Activity-level: try both keys (some setups reuse the deal key on activities)
+  let aTid = null;
+  for (const k of [ACTIVITY_TEAM_KEY, DEAL_TEAM_KEY].filter(Boolean)) {
+    const id = activity ? readEnumId(activity[k]) : null;
+    if (id) { aTid = id; break; }
+  }
+  if (aTid) {
+    const teamName  = PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`;
+    const channelId = PRODUCTION_TEAM_TO_CHANNEL[aTid] || null;
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: String(aTid), dTid: null, used: String(aTid), owner: activity?.owner_name || null, source:'activity' });
+    return { teamId: String(aTid), teamName, channelId, _source:'activity' };
   }
 
-  if (tid) {
-    const teamName  = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
-    const channelId = PRODUCTION_TEAM_TO_CHANNEL[tid] || null;
-    return { teamId: String(tid), teamName, channelId };
+  // 2) Deal-level
+  let dTid = null;
+  if (allowDealFallback && deal && DEAL_TEAM_KEY) {
+    dTid = readEnumId(deal[DEAL_TEAM_KEY]) || null;
+    if (dTid) {
+      const teamName  = PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`;
+      const channelId = PRODUCTION_TEAM_TO_CHANNEL[dTid] || null;
+      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: String(dTid), used: String(dTid), owner: activity?.owner_name || null, source:'deal' });
+      return { teamId: String(dTid), teamName, channelId, _source:'deal' };
+    }
   }
 
   // 3) Fallback: infer from activity owner / assigned user
@@ -551,10 +550,12 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    return { teamId: null, teamName: ownerName, channelId: null };
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: null, used: ownerName, owner: ownerName, source:'owner' });
+    return { teamId: null, teamName: ownerName, channelId: null, _source:'owner' };
   }
 
-  return { teamId: null, teamName: null, channelId: null };
+  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: null, used: null, owner: activity?.owner_name || null, source:'none' });
+  return { teamId: null, teamName: null, channelId: null, _source:'none' };
 }
 
 
