@@ -528,17 +528,7 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
                || (typeof activity?.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null)
                || null;
 
-  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_name || null;
-  const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
-
-  if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    return { teamId: null, teamName: ownerName, channelId: null };
-  }
-
-  return { teamId: null, teamName: null, channelId: null };
-}
-
-// (no top-level console.log here)
+  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_na_
 
 
   // 3) Fallback: infer from activity owner / assigned user
