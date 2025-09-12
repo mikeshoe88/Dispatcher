@@ -494,27 +494,58 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   }
 }
 
-
-/* ========= Assignee detection (enum-only) ========= */
+/* ========= Assignee detection (enum + fallbacks) ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
+// Build a quick lowercase name lookup from your PRODUCTION_TEAM_MAP values
+const TEAM_NAME_SET = new Set(
+  Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
+);
+
 /**
- * Returns teamName for PD renames always.
- * channelId only if a Slack mapping exists.
- * allowDealFallback:
- *   - true  → if activity team empty, use deal team
- *   - false → activity-only; if absent, nulls
+ * Detects assignee/crew for:
+ *   1) Activity-level Production Team enum (preferred)
+ *   2) Deal-level Production Team enum (fallback)
+ *   3) Activity owner / assigned user name (last resort)
+ *
+ * Returns { teamId, teamName, channelId }
  */
 function detectAssignee({ deal, activity, allowDealFallback = true }) {
+  // 1) Activity-level enum
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  // 2) Deal-level enum (if allowed)
   const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
-  const teamName  = tid ? (PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`) : null;
-  const channelId = tid ? (PRODUCTION_TEAM_TO_CHANNEL[tid] || null) : null;
+  // If we have an enum id, we can map cleanly.
+  if (tid) {
+    const teamName  = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
+    const channelId = PRODUCTION_TEAM_TO_CHANNEL[tid] || null;
+    return { teamId: String(tid), teamName, channelId };
+  }
 
-  return { teamId: tid ? String(tid) : null, teamName, channelId };
+  // 3) Fallback: infer from activity owner / assigned user
+  // Pipedrive activity typically has `user_id` (object or id) and sometimes `assigned_to_user_id`.
+  // Try to read a displayable name.
+  const userObj = (typeof activity?.user_id === 'object' ? activity.user_id : null)
+               || (typeof activity?.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null)
+               || null;
+
+  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_name || null;
+  const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
+
+  // Only accept ownerName if it looks like one of our crew names to avoid random names.
+  if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
+    // We don't have a teamId when coming from names, but we can still rename correctly.
+    return { teamId: null, teamName: ownerName, channelId: null };
+  }
+
+  // Nothing detected
+  return { teamId: null, teamName: null, channelId: null };
 }
+
+console.log(`[ASSIGNEE/ACT] id=${activity.id} owner_name=${activity?.owner_name || 'n/a'} user_id=${JSON.stringify(activity?.user_id || null)}`);
+
 
 /* ========= Minimal channel resolution ========= */
 // No more Slack-wide scanning; just use FORCE or DEFAULT.
