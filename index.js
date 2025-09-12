@@ -501,8 +501,26 @@ const TEAM_NAME_SET = new Set(
 );
 
 /**
+ * Probe the activity for any 40-hex custom field whose value matches a Production Team enum.
+ * Returns { id, key } or null.
+ */
+function probeActivityTeamId(activity){
+  if (!activity) return null;
+  const VALID = new Set(Object.keys(PRODUCTION_TEAM_MAP).map(n => Number(n)));
+  for (const [key, val] of Object.entries(activity)){
+    if (!/^[a-f0-9]{40}$/i.test(key)) continue; // PD custom field shape
+    let v = null;
+    if (val && typeof val === 'object' && 'value' in val) v = Number(val.value);
+    else if (typeof val === 'number') v = val;
+    else if (typeof val === 'string' && /^\d+$/.test(val)) v = Number(val);
+    if (v != null && VALID.has(v)) return { id: v, key };
+  }
+  return null;
+}
+
+/**
  * Detects assignee/crew in this order:
- *   1) Activity-level Production Team enum (check BOTH keys)
+ *   1) Activity-level Production Team enum (explicit keys, then probe)
  *   2) Deal-level Production Team enum
  *   3) Activity owner / assigned user name
  *
@@ -512,32 +530,36 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
   const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
 
-  // 1) Activity-level: try both keys (some setups reuse the deal key on activities)
-  let aTid = null;
+  // 1) Activity-level — try explicit key, then deal key (some reuse), then probe
+  let aTid = null, aKeyUsed = null;
   for (const k of [ACTIVITY_TEAM_KEY, DEAL_TEAM_KEY].filter(Boolean)) {
     const id = activity ? readEnumId(activity[k]) : null;
-    if (id) { aTid = id; break; }
+    if (id) { aTid = id; aKeyUsed = k; break; }
+  }
+  if (!aTid) {
+    const probed = probeActivityTeamId(activity);
+    if (probed) { aTid = probed.id; aKeyUsed = probed.key; }
   }
   if (aTid) {
     const teamName  = PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`;
     const channelId = PRODUCTION_TEAM_TO_CHANNEL[aTid] || null;
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: String(aTid), dTid: null, used: String(aTid), owner: activity?.owner_name || null, source:'activity' });
-    return { teamId: String(aTid), teamName, channelId, _source:'activity' };
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:String(aTid), aKeyUsed, dTid:null, used:String(aTid), owner:activity?.owner_name||null, source:'activity' });
+    return { teamId:String(aTid), teamName, channelId, _source:'activity' };
   }
 
-  // 2) Deal-level
+  // 2) Deal-level fallback
   let dTid = null;
   if (allowDealFallback && deal && DEAL_TEAM_KEY) {
     dTid = readEnumId(deal[DEAL_TEAM_KEY]) || null;
     if (dTid) {
       const teamName  = PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`;
       const channelId = PRODUCTION_TEAM_TO_CHANNEL[dTid] || null;
-      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: String(dTid), used: String(dTid), owner: activity?.owner_name || null, source:'deal' });
-      return { teamId: String(dTid), teamName, channelId, _source:'deal' };
+      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:String(dTid), used:String(dTid), owner:activity?.owner_name||null, source:'deal' });
+      return { teamId:String(dTid), teamName, channelId, _source:'deal' };
     }
   }
 
-  // 3) Fallback: infer from activity owner / assigned user
+  // 3) Owner fallback
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -550,12 +572,12 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: null, used: ownerName, owner: ownerName, source:'owner' });
-    return { teamId: null, teamName: ownerName, channelId: null, _source:'owner' };
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:null, used:ownerName, owner:ownerName, source:'owner' });
+    return { teamId:null, teamName:ownerName, channelId:null, _source:'owner' };
   }
 
-  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, dTid: null, used: null, owner: activity?.owner_name || null, source:'none' });
-  return { teamId: null, teamName: null, channelId: null, _source:'none' };
+  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:null, aKeyUsed:null, dTid:null, used:null, owner:activity?.owner_name||null, source:'none' });
+  return { teamId:null, teamName:null, channelId:null, _source:'none' };
 }
 
 
@@ -967,7 +989,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -977,7 +999,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal
       const listRes = await fetch(
-        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1173,7 +1195,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1182,7 +1204,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1217,4 +1239,3 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   await app.start(PORT);
   console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
-
