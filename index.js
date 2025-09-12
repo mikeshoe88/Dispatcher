@@ -55,7 +55,7 @@ function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');
-const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS'); // defined for completeness
 
 function normalizeForInvoice(s=''){
   return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
@@ -92,7 +92,7 @@ const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAM
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
 
-// ===== Crew chief auto-invite (optional) =====
+/* ===== Crew chief auto-invite (optional) ===== */
 const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
 const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
 function parseChiefMap(raw=''){
@@ -984,7 +984,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
         // Posting behavior: only due today (unless POST_FUTURE_WOS)
         if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          try { await deleteAssigneePost(activity.id); } catch {}
+          try {
+            await deleteAssigneePost(activity.id);
+          } catch {}
           continue;
         }
 
