@@ -744,7 +744,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
       const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-      const pjson = await pres.json();
+      const pjson = await res.json();
       if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
     }
   } catch {}
