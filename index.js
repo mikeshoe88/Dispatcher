@@ -45,11 +45,6 @@ function shouldPostToJobChannel({ assigneeChannelId }){
 // Job-channel content style: 'summary' | 'pdf'
 const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
-// Skip invoice-like tasks entirely
-const SKIP_INVOICE_TASKS = process.env.SKIP_INVOICE_TASKS !== 'false';
-const INVOICE_KEYWORDS = (process.env.INVOICE_KEYWORDS || 'invoice,billing,billed,bill,payment request,collect payment,final invoice,send invoice,ar follow up,accounts receivable')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-
 /* ===== Subject lists ===== */
 function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -391,24 +386,6 @@ async function getBestLocation(deal){
   if (orgAddr) return orgAddr;
   const dealAddr = _readDealCustomAddress(deal);
   return dealAddr || 'N/A';
-}
-
-/* ========= Invoice detection ========= */
-function isInvoiceLike(activity){
-  if (!SKIP_INVOICE_TASKS) return false;
-  const subjectNorm = normalizeForInvoice(activity?.subject || '');
-  const noteNorm    = normalizeForInvoice(htmlToPlainText(activity?.note || ''));
-  const EXACTS = (process.env.INVOICE_EXACT_SUBJECTS || 'billed/invoice,invoice,invoice task,collect payment,final invoice,bill in 5 days')
-    .split(',').map(s => normalizeForInvoice(s)).filter(Boolean);
-  if (EXACTS.includes(subjectNorm)) return true;
-  if (subjectNorm.startsWith('invoice:') || subjectNorm.startsWith('invoice -') || subjectNorm.startsWith('billed/')) return true;
-  const escaped = INVOICE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const re = new RegExp(`(?:^|\\b)(${escaped.join('|')})(?:\\b|$)`, 'i');
-  return re.test(subjectNorm) || re.test(noteNorm);
-}
-function isBilledInvoiceSubject(subject){
-  const n = normalizeForInvoice(subject || '');
-  return n === 'billed/invoice' || n.startsWith('billed/invoice');
 }
 
 /* ========= Type gating ========= */
