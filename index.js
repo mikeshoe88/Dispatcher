@@ -55,7 +55,7 @@ function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');
-const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS'); // defined for completeness
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');
 
 function normalizeForInvoice(s=''){
   return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
@@ -71,8 +71,7 @@ function subjectMatchesList(subject, list){
 }
 
 // ===== Subject renaming controls & debug =====
-// 'never' | 'when_missing' | 'always'
-const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase();
+const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
 const RENAME_FORMAT    = process.env.RENAME_FORMAT || 'append';
 const DEBUG_RENAME     = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
@@ -92,7 +91,7 @@ const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAM
   ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
 
-/* ===== Crew chief auto-invite (optional) ===== */
+// ===== Crew chief auto-invite (optional) =====
 const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
 const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
 function parseChiefMap(raw=''){
@@ -466,7 +465,6 @@ async function pdPutSubject(activityId, newSubject, attempts=2){
   return last?.j || { success:false };
 }
 
-// Only PUT when needed, with policy gates and retry
 async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   const want = (assigneeName || '').trim();
   if (!activityId || !want) return { did:false, reason:'no-assignee' };
@@ -503,7 +501,6 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
 }
 
 /* ========= Assignee detection (enum + fallbacks) ========= */
-// NOTE: do NOT re-declare readEnumId anywhere else.
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 // Build a quick lowercase name lookup from your PRODUCTION_TEAM_MAP values
@@ -553,7 +550,6 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
 }
 
 /* ========= Minimal channel resolution ========= */
-// No more Slack-wide scanning; just use FORCE or DEFAULT.
 async function resolveDealChannelId({ allowDefault = ALLOW_DEFAULT_FALLBACK }){
   if (FORCE_CHANNEL_ID) return FORCE_CHANNEL_ID;
   return allowDefault ? DEFAULT_CHANNEL : null;
@@ -678,7 +674,7 @@ async function deleteAssigneePost(activityId){
 
 /* ========= Slack message builders ========= */
 function stripCrewSuffix(s=''){
-  return String(s).replace(/\s*[—-]\s*Crew:\s*[A-Za-z][A-Za-z ]*$/i, '').trim();
+  return String(s).replace(/\s*[—-]\s*Crew:\s*[A-Za-z][A-Za-z ']*$/i, '').trim();
 }
 function buildSummary({ activity, deal, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
@@ -893,28 +889,25 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       if (deal && !isDealActive(deal)) { return res.status(200).send('OK'); }
 
-      // resolve assignee (activity first, then deal)
+      // resolve assignee (activity first, then deal, else name fallback)
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({teamName:assignee.teamName, teamId:assignee.teamId, channelId:!!assignee.channelId&&'yes'})}`);
       dbgRename('assignee', assignee);
 
-      const gateFlags = {
-        invoice: isInvoiceLike(activity),
-        typeAllowed: isTypeAllowedForRename(activity),
-        inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-        hasTeamName: !!assignee.teamName,
-        renamePolicy: RENAME_ON_ASSIGN
-      };
-      dbgRename('gates', gateFlags);
-
-      // === ALWAYS attempt rename (subject) within gates ===
-      if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
+      // ====== RENAME GATE (this is the block you were looking for) ======
+      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
+          !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
         const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        dbgRename('rename-result', { id: activity.id, from: activity.subject, result: r });
         if (r?.did && r.subject) activity.subject = r.subject;
       } else {
-        dbgRename('rename-skipped', gateFlags);
+        dbgRename('rename-skipped', {
+          invoice: isInvoiceLike(activity),
+          typeAllowed: isTypeAllowedForRename(activity),
+          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+          hasTeamName: !!assignee.teamName
+        });
       }
+      // ================================================================
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
@@ -964,29 +957,26 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       for (const activity of items) {
         const ass = detectAssignee({ deal, activity, allowDealFallback: true });
 
-        // Rename attempt
+        // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
         try {
-          const gateFlags = {
-            invoice: isInvoiceLike(activity),
-            typeAllowed: isTypeAllowedForRename(activity),
-            inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-            hasTeamName: !!ass.teamName,
-            renamePolicy: RENAME_ON_ASSIGN
-          };
-          dbgRename('deal-update-gates', { aid: activity.id, ...gateFlags });
-
-          if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
+          if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
+              !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && ass.teamName) {
             const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
-            dbgRename('deal-update-rename', { id: activity.id, from: activity.subject, result: r });
             if (r?.did && r.subject) activity.subject = r.subject;
+          } else {
+            dbgRename('deal-update-gates', {
+              aid: activity.id,
+              invoice: isInvoiceLike(activity),
+              typeAllowed: isTypeAllowedForRename(activity),
+              inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+              hasTeamName: !!ass.teamName
+            });
           }
         } catch (e) { /* ignore */ }
 
         // Posting behavior: only due today (unless POST_FUTURE_WOS)
         if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          try {
-            await deleteAssigneePost(activity.id);
-          } catch {}
+          try { await deleteAssigneePost(activity.id); } catch {}
           continue;
         }
 
@@ -1042,18 +1032,11 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
 
-      // Rename consistency during morning run too
+      // ====== SAME RENAME GATE IN 7AM RUN ======
       try {
-        const gateFlags = {
-          invoice: isInvoiceLike(activity),
-          typeAllowed: isTypeAllowedForRename(activity),
-          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-          hasTeamName: !!assignee.teamName,
-          renamePolicy: RENAME_ON_ASSIGN
-        };
-        if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
+        if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
+            !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
           const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-          dbgRename('7am-rename', { id: activity.id, from: activity.subject, result: r });
           if (r?.did && r.subject) activity.subject = r.subject;
         }
       } catch {}
