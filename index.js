@@ -79,17 +79,6 @@ function dbgRename(step, payload) {
   catch { console.log(`[RENAME][${step}]`, payload); }
 }
 
-// Debounce window to avoid rename tug-of-war
-const RENAME_DEBOUNCE_MS = Number(process.env.RENAME_DEBOUNCE_MS || 7000);
-const LAST_RENAME_UNTIL = new Map(); // aid -> epoch ms until which we skip further renames
-function recentlyRenamed(aid){
-  const t = LAST_RENAME_UNTIL.get(String(aid));
-  return t && t > Date.now();
-}
-function markRenamed(aid){
-  LAST_RENAME_UNTIL.set(String(aid), Date.now() + RENAME_DEBOUNCE_MS);
-}
-
 // ===== Type-based gating =====
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -453,50 +442,71 @@ async function pdPutSubject(activityId, newSubject, attempts=2){
   return last?.j || { success:false };
 }
 
-/* ===== Assignee detection helpers ===== */
-function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
-const TEAM_NAME_SET = new Set(Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean));
-const TEAM_ID_BY_NAME = Object.entries(PRODUCTION_TEAM_MAP).reduce((m,[id,name]) => (m[String(name).toLowerCase()] = Number(id), m), {});
-function teamNameById(id){ return PRODUCTION_TEAM_MAP[id] || `Team ${id}`; }
+async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
+  const want = (assigneeName || '').trim();
+  if (!activityId || !want) return { did:false, reason:'no-assignee' };
 
-/**
- * Strict desired-crew chooser for renaming:
- * 1) Use activity Production Team if present.
- * 2) Else, if subject already has a known Crew tag, stick with it (prevents flip-flop).
- * 3) Else, fall back to deal Production Team if present.
- */
-function chooseDesiredCrewName({ activity, deal }) {
-  const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  if (aTid) return teamNameById(aTid);
+  const haveCrew = extractCrewName(currentSubject);
+  const wantCrew = normalizeName(want);
 
-  const currentCrewFromSubject = extractCrewName(activity?.subject || '');
-  if (currentCrewFromSubject && TEAM_NAME_SET.has(currentCrewFromSubject)) {
-    // Preserve what's already on the subject if activity enum is blank
-    return currentCrewFromSubject.replace(/\b\w/g, c => c.toUpperCase()); // nice-case
+  if (DEBUG_RENAME) {
+    console.log(`[RENAME] check id=${activityId} have=${haveCrew} want=${wantCrew} subj=${JSON.stringify(currentSubject)}`);
   }
 
-  const dTid = deal ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
-  if (dTid) return teamNameById(dTid);
+  // RENAME_ON_ASSIGN policy
+  if (RENAME_ON_ASSIGN === 'never') return { did:false, reason:'policy-never' };
+  if (RENAME_ON_ASSIGN === 'when_missing' && haveCrew) return { did:false, reason:'has-crew' };
 
-  return null;
+  if (haveCrew === wantCrew) return { did:false, reason:'already-correct' };
+
+  const newSubject = buildRenamedSubject(currentSubject || '', want);
+  if (!newSubject || newSubject === currentSubject) return { did:false, reason:'no-op' };
+
+  console.log(`[RENAME] PUT id=${activityId}: "${currentSubject}" -> "${newSubject}"`);
+  const putJ = await pdPutSubject(activityId, newSubject, 3);
+  if (!putJ?.success) return { did:false, reason:'pd-put-failed' };
+
+  // Fresh read to collapse races
+  try {
+    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const a2j = await a2.json();
+    const subjNow = a2j?.data?.subject || newSubject;
+    return { did:true, subject:subjNow };
+  } catch {
+    return { did:true, subject:newSubject };
+  }
 }
 
+/* ========= Assignee detection (enum + fallbacks) ========= */
+function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
+
+// Build a quick lowercase name lookup from your PRODUCTION_TEAM_MAP values
+const TEAM_NAME_SET = new Set(
+  Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
+);
+
 /**
- * Channel/assignee detection used for posting (more permissive; allows deal fallback).
+ * Detects assignee/crew for:
+ *   1) Activity-level Production Team enum (preferred)
+ *   2) Deal-level Production Team enum (fallback)
+ *   3) Activity owner / assigned user name (last resort)
+ *
  * Returns { teamId, teamName, channelId }
  */
 function detectAssignee({ deal, activity, allowDealFallback = true }) {
+  // 1) Activity-level enum
   const aTid = activity ? readEnumId(activity[PRODUCTION_TEAM_FIELD_KEY]) : null;
+  // 2) Deal-level enum (if allowed)
   const dTid = (!aTid && allowDealFallback && deal) ? readEnumId(deal[PRODUCTION_TEAM_FIELD_KEY]) : null;
   const tid  = aTid || dTid || null;
 
   if (tid) {
-    const teamName  = teamNameById(tid);
+    const teamName  = PRODUCTION_TEAM_MAP[tid] || `Team ${tid}`;
     const channelId = PRODUCTION_TEAM_TO_CHANNEL[tid] || null;
     return { teamId: String(tid), teamName, channelId };
   }
 
-  // last resort: infer from owner fields (kept as-is)
+  // 3) Fallback: infer from activity owner / assigned user
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -514,50 +524,6 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   }
 
   return { teamId: null, teamName: null, channelId: null };
-}
-
-async function ensureCrewTagMatches(activityId, currentSubject, desiredCrewName) {
-  const want = (desiredCrewName || '').trim();
-  if (!activityId || !want) return { did:false, reason:'no-assignee' };
-
-  if (recentlyRenamed(activityId)) {
-    dbgRename('debounce-skip', { aid: activityId, want });
-    return { did:false, reason:'debounced' };
-  }
-
-  const haveCrew = extractCrewName(currentSubject);
-  const wantCrew = normalizeName(want);
-
-  if (DEBUG_RENAME) {
-    console.log(`[RENAME] check id=${activityId} have=${haveCrew} want=${wantCrew} subj=${JSON.stringify(currentSubject)}`);
-  }
-
-  // Policy
-  if (RENAME_ON_ASSIGN === 'never') return { did:false, reason:'policy-never' };
-  if (RENAME_ON_ASSIGN === 'when_missing' && haveCrew) return { did:false, reason:'has-crew' };
-
-  if (haveCrew === wantCrew) return { did:false, reason:'already-correct' };
-
-  const newSubject = buildRenamedSubject(currentSubject || '', want);
-  if (!newSubject || newSubject === currentSubject) return { did:false, reason:'no-op' };
-
-  console.log(`[RENAME] PUT id=${activityId}: "${currentSubject}" -> "${newSubject}"`);
-  const putJ = await pdPutSubject(activityId, newSubject, 3);
-  if (!putJ?.success) return { did:false, reason:'pd-put-failed' };
-
-  markRenamed(activityId);
-
-  // Small settle delay so subsequent fetch sees the updated subject
-  await new Promise(r => setTimeout(r, Number(process.env.RENAME_SETTLE_MS || 300)));
-
-  try {
-    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
-    const a2j = await a2.json();
-    const subjNow = a2j?.data?.subject || newSubject;
-    return { did:true, subject:subjNow };
-  } catch {
-    return { did:true, subject:newSubject };
-  }
 }
 
 /* ========= Minimal channel resolution ========= */
@@ -849,4 +815,365 @@ function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
     if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
-      return res.status(
+      res.status(403).send('Forbidden');
+      return; // avoid 'illegal return' at module top when bundlers misparse
+    }
+
+    const meta = req.body?.meta || {};
+    const rawEntity = (meta.entity || '').toString().toLowerCase();
+    const rawAction = (meta.action || meta.event || meta.change || '').toString().toLowerCase();
+
+    const action = /^(create|add|added)$/.test(rawAction) ? 'create'
+      : /^(update|updated|change|changed)$/.test(rawAction) ? 'update'
+      : /^(delete|deleted)$/.test(rawAction) ? 'delete'
+      : rawAction || 'unknown';
+
+    const entity = rawEntity || 'unknown';
+    const data = req.body?.data || req.body?.current || null;
+
+    console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
+
+    // ===== Activity create/update =====
+    if (entity === 'activity' && (action === 'create' || action === 'update')) {
+      if (!data?.id) { res.status(200).send('No activity'); return; }
+      if (data.done === true || data.done === 1) { res.status(200).send('OK'); return; }
+
+      // de-dup incoming PD webhooks
+      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
+        dbgRename('skip-dedup', {
+          entity, action, aid: data?.id,
+          meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp }
+        });
+        res.status(200).send('OK');
+        return;
+      }
+
+      // fetch the latest activity
+      const aRes = await fetch(
+        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      );
+      const aJson = await aRes.json();
+      if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
+      const activity = aJson.data;
+
+      dbgRename('activity-fetched', {
+        id: activity.id, subject: activity.subject, type: activity.type,
+        due_date: activity.due_date, due_time: activity.due_time, done: activity.done
+      });
+
+      if (activity.done === true || activity.done === 1) { res.status(200).send('OK'); return; }
+
+      // fetch the deal (so we can fall back to deal-level enum)
+      let deal = null;
+      if (activity.deal_id) {
+        const dRes = await fetch(
+          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        );
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      }
+      if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
+      if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
+
+      // resolve assignee: STRICT activity enum → (optional) deal enum fallback
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+      console.log(
+        `[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
+          teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
+        })}`
+      );
+      dbgRename('assignee', assignee);
+
+      // ===== RENAME GATE =====
+      if (isTypeAllowedForRename(activity) && assignee.teamName) {
+        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        if (r?.did && r.subject) activity.subject = r.subject;
+      } else {
+        dbgRename('rename-skipped', {
+          typeAllowed: isTypeAllowedForRename(activity),
+          inNeverList: false,
+          hasTeamName: !!assignee.teamName
+        });
+      }
+
+      // === Slack posting is gated by due date ===
+      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+        try { await deleteAssigneePost(activity.id); } catch {}
+        res.status(200).send('OK');
+        return;
+      }
+      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
+        res.status(200).send('OK');
+        return;
+      }
+
+      const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+      await postWorkOrderToChannels({
+        activity, deal, jobChannelId,
+        assigneeChannelId: assignee.channelId,
+        assigneeName: assignee.teamName,
+        noteText: activity.note
+      });
+
+      res.status(200).send('OK');
+      return;
+    }
+
+    // ===== Deal update: re-assign/rename all open activities =====
+    if (entity === 'deal' && action === 'update') {
+      const dealId = data?.id;
+      if (!dealId) { res.status(200).send('No deal'); return; }
+
+      // fetch full, current deal
+      let deal = null;
+      try {
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      } catch (e) {
+        console.warn('[PD Hook] DEAL fetch failed; falling back to webhook data', e?.message || e);
+      }
+      deal = deal || data;
+
+      // list all OPEN activities on this deal
+      const listRes = await fetch(
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      );
+      const listJson = await listRes.json();
+      const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
+
+      const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+
+      for (const activity of items) {
+        const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+
+        // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
+        try {
+          if (isTypeAllowedForRename(activity) && ass.teamName) {
+            const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
+            if (r?.did && r.subject) activity.subject = r.subject;
+          } else {
+            dbgRename('deal-update-gates', {
+              aid: activity.id,
+              typeAllowed: isTypeAllowedForRename(activity),
+              inNeverList: false,
+              hasTeamName: !!ass.teamName
+            });
+          }
+        } catch (e) { /* ignore */ }
+
+        // Posting behavior: only due today (unless POST_FUTURE_WOS)
+        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+          try { await deleteAssigneePost(activity.id); } catch {}
+          continue;
+        }
+
+        if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
+
+        await postWorkOrderToChannels({
+          activity, deal, jobChannelId,
+          assigneeChannelId: ass.channelId,
+          assigneeName: ass.teamName,
+          noteText: activity.note
+        });
+      }
+
+      res.status(200).send('OK');
+      return;
+    }
+
+    // ===== Activity delete =====
+    if (entity === 'activity' && (action === 'delete')) {
+      const id = data?.id || meta?.entity_id;
+      console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
+      if (id) await deleteAssigneePost(id);
+      res.status(200).send('OK');
+      return;
+    }
+
+    console.log('[PD Hook] ignored event entity=%s action=%s', entity, action);
+    res.status(200).send('OK');
+    return;
+  } catch (error) {
+    console.error('[PD Hook] ERROR:', error?.stack || error?.data || error?.message || error);
+    res.status(500).send('Server error.');
+    return;
+  }
+});
+
+/* ========= 7:00 AM CT daily runner ========= */
+expressApp.get('/dispatch/run-7am', async (_req, res) => {
+  try {
+    const today = DateTime.now().setZone(TZ).toISODate();
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const listJson = await listRes.json();
+    const all = Array.isArray(listJson?.data) ? listJson.data : [];
+    const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
+    dueToday.sort(compareByStartTime);
+
+    let posted = 0;
+    for (const activity of dueToday) {
+      let deal = null;
+      if (activity.deal_id){
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dJson = await dRes.json();
+        if (dJson?.success && dJson.data) deal = dJson.data;
+      }
+      if (deal && !isDealActive(deal)) continue;
+
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+      const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+
+      // ====== SAME RENAME GATE IN 7AM RUN ======
+      try {
+        if (isTypeAllowedForRename(activity) && assignee.teamName) {
+          const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+          if (r?.did && r.subject) activity.subject = r.subject;
+        }
+      } catch {}
+
+      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
+
+      await postWorkOrderToChannels({
+        activity, deal, jobChannelId,
+        assigneeChannelId: assignee.channelId,
+        assigneeName: assignee.teamName,
+        noteText: activity.note
+      });
+      posted++;
+    }
+    res.status(200).send(`OK – posted ${posted} due-today WOs`);
+  } catch (e) {
+    console.error('[7AM] runner error', e?.message||e);
+    res.status(500).send('error');
+  }
+});
+
+/* ========= QR Complete ========= */
+expressApp.get('/wo/complete', async (req, res) => {
+  try {
+    const { aid, did, cid, exp, sig } = req.query || {};
+    if (!aid || !exp || !sig) { res.status(400).send('Missing params.'); return; }
+    const now = Math.floor(Date.now()/1000);
+    if (Number(exp) < now) { res.status(410).send('Link expired.'); return; }
+    const raw = `${aid}.${did || ''}.${cid || ''}.${exp}`;
+    if (!verify(raw, sig)) { res.status(403).send('Bad signature.'); return; }
+
+    const markedAtIso = new Date().toISOString();
+    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
+    });
+    const pdJson = await pdResp.json();
+    const ok = !!(pdJson && pdJson.success);
+
+    let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
+    try {
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const aJson = await aRes.json();
+      if (aJson?.success && aJson.data) {
+        activity = aJson.data;
+        const dealId = did || activity.deal_id;
+        if (dealId) {
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const dJson = await dRes.json();
+          if (dJson?.success && dJson.data) {
+            deal = dJson.data;
+            dealTitle = deal.title || 'N/A';
+            const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+            typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+            location = await getBestLocation(deal);
+          }
+        }
+      }
+    } catch (e) { console.warn('[WO] fetch for completion PDF failed', e?.message||e); }
+
+    const dealIdForUpload = did || activity?.deal_id;
+
+    try {
+      const completedPdf = await buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location, completedAt: Date.now() });
+      const up = await uploadPdfToPipedrive({ dealId: dealIdForUpload, pdfBuffer: completedPdf, filename: `WO_${aid}_Completed.pdf` });
+      console.log('[WO] completion PDF uploaded', up?.success);
+      const jobChannel = cid || await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK }) || DEFAULT_CHANNEL;
+      if (jobChannel) {
+        await uploadPdfToSlack({ channel: jobChannel, filename: `WO_${aid}_Completed.pdf`, pdfBuffer: completedPdf, title: 'Work Order Completed', initialComment: `✅ Completed Work Order for activity ${aid}. ${AID_TAG(aid)}` });
+      }
+    } catch (e) {
+      console.error('[WO] completion PDF upload failed', e?.message||e);
+    }
+
+    try {
+      const when = new Date().toLocaleString();
+      const subject = activity?.subject ? `“${activity.subject}”` : '';
+      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          deal_id: dealIdForUpload,
+          content: `✅ Work Order Completed via QR Scan.\nActivity ${aid} ${subject} marked done at ${when}.\nA completion PDF has been attached to the deal.`
+        })
+      });
+    } catch(e) { console.error('[WO] PD completion note failed', e?.message||e); }
+
+    await deleteAssigneePost(aid);
+
+    res.status(200).send(
+      `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
+       <p>Task <b>${aid}</b> ${ok ? 'has been updated' : 'could not be updated'} in Pipedrive.</p>
+       ${did ? `<p>Deal: <b>${did}</b></p>` : ''}
+       <p>${ok ? 'A completion PDF and note have been attached. ✅' : 'Please contact the office. ⚠️'}</p></body></html>`
+    );
+  } catch (err) {
+    console.error('/wo/complete error:', err);
+    res.status(500).send('Server error.');
+  }
+});
+
+/* ========= On-demand WO PDF ========= */
+expressApp.get('/wo/pdf', async (req,res)=>{
+  try{
+    const aid = req.query.aid;
+    if(!aid) { res.status(400).send('Missing aid'); return; }
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aj = await aRes.json();
+    if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
+    const data = aj.data;
+
+    // No invoice filtering: always allow building WO PDF
+    let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
+    const dealId = data.deal_id;
+    if (dealId){
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dj = await dRes.json();
+      if (dj?.success && dj.data){
+        deal = dj.data;
+        dealTitle = deal.title || 'N/A';
+        const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
+        typeOfService = SERVICE_MAP[serviceId] || 'N/A';
+        location = await getBestLocation(deal);
+        const ass = detectAssignee({ deal, activity: data, allowDealFallback: true });
+        assigneeName = ass.teamName || assigneeName;
+        const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
+        if (pid) {
+          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const pjson = await pres.json();
+          if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
+        }
+      }
+    }
+
+    const channelIdForQr = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+    const pdfBuffer = await buildWorkOrderPdfBuffer({ activity: data, dealTitle, typeOfService, location, channelForQR: channelIdForQr || DEFAULT_CHANNEL, assigneeName, customerName, jobNumber: deal?.id });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="WO_${aid}.pdf"`);
+    return res.send(pdfBuffer);
+  }catch(e){
+    console.error('/wo/pdf error', e);
+    res.status(500).send('error');
+  }
+});
+
+/* ========= Start ========= */
+(async () => {
+  await app.start(PORT);
+  console.log(`✅ Dispatcher running on port ${PORT}`);
+})();
