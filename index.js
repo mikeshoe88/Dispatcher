@@ -276,6 +276,23 @@ const PRODUCTION_TEAM_MAP = {
   60: "Slot 5"
 };
 
+/* ========= Minimal channel resolution ========= */
+async function resolveDealChannelId({ allowDefault = ALLOW_DEFAULT_FALLBACK } = {}) {
+  if (FORCE_CHANNEL_ID) return FORCE_CHANNEL_ID;
+  return allowDefault ? DEFAULT_CHANNEL : null;
+}
+
+async function ensureBotInChannel(channelId) {
+  if (!channelId) return;
+  try { await app.client.conversations.join({ channel: channelId }); }
+  catch (_e) { /* ignore join errors */ }
+}
+
+/* ========= Reassignment & completion tracking ========= */
+const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
+const AID_TAG = (id)=>`[AID:${id}]`;
+
+
 // PD custom field keys
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 const DEAL_ADDRESS_KEY          = 'd204334da759b00ceeb544837f8f0f016c9f3e5f';
