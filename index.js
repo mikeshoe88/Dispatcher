@@ -882,21 +882,20 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       );
       dbgRename('assignee', assignee);
 
-      // ===== RENAME GATE =====
-      if (!isInvoiceLike(activity) &&
-          isTypeAllowedForRename(activity) &&
-          !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
-          assignee.teamName) {
-        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-        if (r?.did && r.subject) activity.subject = r.subject;
-      } else {
-        dbgRename('rename-skipped', {
-          invoice: isInvoiceLike(activity),
-          typeAllowed: isTypeAllowedForRename(activity),
-          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-          hasTeamName: !!assignee.teamName
-        });
-      }
+    // ===== RENAME GATE =====
+if (isTypeAllowedForRename(activity) &&
+    !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
+    assignee.teamName) {
+  const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+  if (r?.did && r.subject) activity.subject = r.subject;
+} else {
+  dbgRename('rename-skipped', {
+    typeAllowed: isTypeAllowedForRename(activity),
+    inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+    hasTeamName: !!assignee.teamName
+  });
+}
+
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
