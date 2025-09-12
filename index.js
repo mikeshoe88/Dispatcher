@@ -77,6 +77,14 @@ const RENAME_FORMAT    = process.env.RENAME_FORMAT || 'append';
 const DEBUG_RENAME     = process.env.DEBUG_RENAME === 'true';
 const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
 
+// Extra debug verbosity for rename path
+const RENAME_DEBUG_LEVEL = Number(process.env.RENAME_DEBUG_LEVEL || (DEBUG_RENAME ? 2 : 0));
+function dbgRename(step, payload) {
+  if (!RENAME_DEBUG_LEVEL) return;
+  try { console.log(`[RENAME][${step}]`, JSON.stringify(payload)); }
+  catch { console.log(`[RENAME][${step}]`, payload); }
+}
+
 // ===== Type-based gating =====
 const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -495,6 +503,7 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
 }
 
 /* ========= Assignee detection (enum + fallbacks) ========= */
+// NOTE: do NOT re-declare readEnumId anywhere else.
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 // Build a quick lowercase name lookup from your PRODUCTION_TEAM_MAP values
@@ -524,33 +533,24 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   }
 
   // 3) Fallback: infer from activity owner / assigned user
-  const userObj = (typeof activity?.user_id === 'object' ? activity.user_id : null)
-               || (typeof activity?.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null)
-               || null;
+  const userObj =
+    (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
+    (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
+    null;
 
-  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_na_
+  const ownerName =
+    (userObj && (userObj.name || userObj.email)) ||
+    (activity ? activity.owner_name : null) ||
+    null;
 
-
-  // 3) Fallback: infer from activity owner / assigned user
-  // Pipedrive activity typically has `user_id` (object or id) and sometimes `assigned_to_user_id`.
-  // Try to read a displayable name.
-  const userObj = (typeof activity?.user_id === 'object' ? activity.user_id : null)
-               || (typeof activity?.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null)
-               || null;
-
-  const ownerName = (userObj && (userObj.name || userObj.email)) || activity?.owner_name || null;
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
 
-  // Only accept ownerName if it looks like one of our crew names to avoid random names.
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    // We don't have a teamId when coming from names, but we can still rename correctly.
     return { teamId: null, teamName: ownerName, channelId: null };
   }
 
-  // Nothing detected
   return { teamId: null, teamName: null, channelId: null };
 }
-
 
 /* ========= Minimal channel resolution ========= */
 // No more Slack-wide scanning; just use FORCE or DEFAULT.
@@ -863,13 +863,22 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     if (entity === 'activity' && (action === 'create' || action === 'update')) {
       if (!data?.id) return res.status(200).send('No activity');
       if (data.done === true || data.done === 1) return res.status(200).send('OK');
-      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) return res.status(200).send('OK');
+
+      if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
+        dbgRename('skip-dedup', { entity, action, aid: data?.id, meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp } });
+        return res.status(200).send('OK');
+      }
 
       // fetch the newest activity
       const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
       const activity = aJson.data;
+
+      dbgRename('activity-fetched', {
+        id: activity.id, subject: activity.subject, type: activity.type,
+        due_date: activity.due_date, due_time: activity.due_time, done: activity.done
+      });
 
       if (activity.done === true || activity.done === 1) { return res.status(200).send('OK'); }
 
@@ -880,21 +889,35 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
+      if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
+
       if (deal && !isDealActive(deal)) { return res.status(200).send('OK'); }
 
       // resolve assignee (activity first, then deal)
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({teamName:assignee.teamName, teamId:assignee.teamId, channelId:!!assignee.channelId&&'yes'})}`);
+      dbgRename('assignee', assignee);
 
-      // === ALWAYS rename in PD (unless invoice-like / blocked type / never lists) ===
-      if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
+      const gateFlags = {
+        invoice: isInvoiceLike(activity),
+        typeAllowed: isTypeAllowedForRename(activity),
+        inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+        hasTeamName: !!assignee.teamName,
+        renamePolicy: RENAME_ON_ASSIGN
+      };
+      dbgRename('gates', gateFlags);
+
+      // === ALWAYS attempt rename (subject) within gates ===
+      if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
         const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        dbgRename('rename-result', { id: activity.id, from: activity.subject, result: r });
         if (r?.did && r.subject) activity.subject = r.subject;
+      } else {
+        dbgRename('rename-skipped', gateFlags);
       }
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-        // cleanup any prior post if we moved out of today
         try { await deleteAssigneePost(activity.id); } catch {}
         return res.status(200).send('OK');
       }
@@ -941,19 +964,27 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       for (const activity of items) {
         const ass = detectAssignee({ deal, activity, allowDealFallback: true });
 
-        // ALWAYS attempt PD rename on deal update
+        // Rename attempt
         try {
-          if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && ass.teamName && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) {
+          const gateFlags = {
+            invoice: isInvoiceLike(activity),
+            typeAllowed: isTypeAllowedForRename(activity),
+            inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+            hasTeamName: !!ass.teamName,
+            renamePolicy: RENAME_ON_ASSIGN
+          };
+          dbgRename('deal-update-gates', { aid: activity.id, ...gateFlags });
+
+          if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
             const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
+            dbgRename('deal-update-rename', { id: activity.id, from: activity.subject, result: r });
             if (r?.did && r.subject) activity.subject = r.subject;
           }
         } catch (e) { /* ignore */ }
 
         // Posting behavior: only due today (unless POST_FUTURE_WOS)
         if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          try {
-            await deleteAssigneePost(activity.id);
-          } catch {}
+          try { await deleteAssigneePost(activity.id); } catch {}
           continue;
         }
 
@@ -1011,8 +1042,16 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       // Rename consistency during morning run too
       try {
-        if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) && assignee.teamName && !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS)) {
+        const gateFlags = {
+          invoice: isInvoiceLike(activity),
+          typeAllowed: isTypeAllowedForRename(activity),
+          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+          hasTeamName: !!assignee.teamName,
+          renamePolicy: RENAME_ON_ASSIGN
+        };
+        if (!gateFlags.invoice && gateFlags.typeAllowed && !gateFlags.inNeverList && gateFlags.hasTeamName) {
           const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+          dbgRename('7am-rename', { id: activity.id, from: activity.subject, result: r });
           if (r?.did && r.subject) activity.subject = r.subject;
         }
       } catch {}
@@ -1163,4 +1202,3 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   await app.start(PORT);
   console.log(`✅ Dispatcher running on port ${PORT}`);
 })();
-
