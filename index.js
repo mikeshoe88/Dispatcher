@@ -884,18 +884,17 @@ if (entity === 'activity' && (action === 'create' || action === 'update')) {
 
   if (activity.done === true || activity.done === 1) return res.status(200).send('OK');
 
-  // ALWAYS fetch the deal so we can fall back to the deal-level enum
+  // fetch the deal (so we can fall back to deal-level enum)
   let deal = null;
-  try {
-    if (activity.deal_id) {
-      const dRes = await fetch(
-        `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`
-      );
-      const dJson = await dRes.json();
-      if (dJson?.success && dJson.data) deal = dJson.data;
-    }
-  } catch {}
+  if (activity.deal_id) {
+    const dRes = await fetch(
+      `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+    );
+    const dJson = await dRes.json();
+    if (dJson?.success && dJson.data) deal = dJson.data;
+  }
   if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
+  if (deal && !isDealActive(deal)) return res.status(200).send('OK');
 
   // resolve assignee: activity enum → deal enum (fallback)
   const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
@@ -922,9 +921,9 @@ if (entity === 'activity' && (action === 'create' || action === 'update')) {
     });
   }
 
-  // (keep whatever posting/other logic you have after this point, or just end)
   return res.status(200).send('OK');
 }
+
 
       // ================================================================
 
