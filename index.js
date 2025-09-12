@@ -848,7 +848,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // fetch the latest activity
       const aRes = await fetch(
-        `https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) return res.status(200).send('Activity fetch fail');
@@ -865,7 +865,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`
+          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
@@ -882,20 +882,19 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       );
       dbgRename('assignee', assignee);
 
-    // ===== RENAME GATE =====
-if (isTypeAllowedForRename(activity) &&
-    !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
-    assignee.teamName) {
-  const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-  if (r?.did && r.subject) activity.subject = r.subject;
-} else {
-  dbgRename('rename-skipped', {
-    typeAllowed: isTypeAllowedForRename(activity),
-    inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
-    hasTeamName: !!assignee.teamName
-  });
-}
-
+      // ===== RENAME GATE =====
+      if (isTypeAllowedForRename(activity) &&
+          !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
+          assignee.teamName) {
+        const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
+        if (r?.did && r.subject) activity.subject = r.subject;
+      } else {
+        dbgRename('rename-skipped', {
+          typeAllowed: isTypeAllowedForRename(activity),
+          inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
+          hasTeamName: !!assignee.teamName
+        });
+      }
 
       // === Slack posting is gated by due date ===
       if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
@@ -925,7 +924,7 @@ if (isTypeAllowedForRename(activity) &&
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -935,7 +934,7 @@ if (isTypeAllowedForRename(activity) &&
 
       // list all OPEN activities on this deal
       const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -947,14 +946,14 @@ if (isTypeAllowedForRename(activity) &&
 
         // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
         try {
-          if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
-              !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && ass.teamName) {
+          if (isTypeAllowedForRename(activity) &&
+              !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
+              ass.teamName) {
             const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
             if (r?.did && r.subject) activity.subject = r.subject;
           } else {
             dbgRename('deal-update-gates', {
               aid: activity.id,
-              invoice: isInvoiceLike(activity),
               typeAllowed: isTypeAllowedForRename(activity),
               inNeverList: subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS),
               hasTeamName: !!ass.teamName
@@ -1001,7 +1000,7 @@ if (isTypeAllowedForRename(activity) &&
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
@@ -1011,7 +1010,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     for (const activity of dueToday) {
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1022,8 +1021,9 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       // ====== SAME RENAME GATE IN 7AM RUN ======
       try {
-        if (!isInvoiceLike(activity) && isTypeAllowedForRename(activity) &&
-            !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) && assignee.teamName) {
+        if (isTypeAllowedForRename(activity) &&
+            !subjectMatchesList(activity.subject, NEVER_RENAME_SUBJECTS) &&
+            assignee.teamName) {
           const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
           if (r?.did && r.subject) activity.subject = r.subject;
         }
@@ -1057,7 +1057,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     if (!verify(raw, sig)) return res.status(403).send('Bad signature.');
 
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
+    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
     });
@@ -1066,13 +1066,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1102,7 +1102,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}` ,{
+      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
@@ -1130,17 +1130,16 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) return res.status(400).send('Missing aid');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) return res.status(404).send('Activity not found');
     const data = aj.data;
 
-    if (isInvoiceLike(data)) return res.status(403).send('Forbidden for invoice activities');
-
+    // No invoice filtering: always allow building WO PDF
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1152,7 +1151,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
