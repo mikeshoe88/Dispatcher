@@ -151,6 +151,7 @@ function alreadyHandledEvent(meta, activity) {
   return false;
 }
 
+
 /* ========= Event dedup (webhook loops) ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
 
@@ -1223,7 +1224,7 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
         // Capture crew from subject BEFORE potential rename to detect reassignment
         const subjCrewBefore = extractCrewName(activity.subject || '');
 
-        const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+        const ass = detectAssignee({ deal, activity, allowDealFallback: false });
 
         // Skip blocked subjects
         if (isSubjectBlocked(activity.subject || '')) continue;
@@ -1512,7 +1513,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
         typeOfService = SERVICE_MAP[serviceId] || 'N/A';
         location = await getBestLocation(deal);
-        const ass = detectAssignee({ deal, activity: data, allowDealFallback: true });
+        const ass = detectAssignee({ deal, activity: data, allowDealFallback: false });
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
@@ -1548,7 +1549,7 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
-    const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+    const ass = detectAssignee({ deal, activity, allowDealFallback: false });
     const parsed = parseDueDateTimeCT(activity);
     const gates = {
       ct_now_iso: DateTime.now().setZone(TZ).toISO(),
