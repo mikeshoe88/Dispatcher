@@ -715,7 +715,7 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
   if(!j?.success){ console.error('PD file upload failed:', j); throw new Error('PD file upload failed'); }
   return j;
 }
-async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
+async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }) {
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
   const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
@@ -731,7 +731,9 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
-      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const pres = await fetch(
+        `https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      );
       const pjson = await pres.json();
       if (pjson?.success && pjson.data) {
         customerName = pjson.data.name || null;
@@ -758,77 +760,90 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
 
   // Invite chiefs (optional)
-  if (INVITE_CREW_CHIEF && (jobChannelId || assigneeChannelId)){
+  if (INVITE_CREW_CHIEF && (jobChannelId || assigneeChannelId)) {
     const inviteChannelId = assigneeChannelId || jobChannelId;
     await ensureBotInChannel(inviteChannelId);
     try {
       const chiefIds = await resolveChiefSlackIds({ assigneeName, deal });
       if (chiefIds.length) await inviteUsersToChannel(inviteChannelId, chiefIds);
-    } catch { /* ignore */ }
+    } catch (e) {
+      // non-fatal
+    }
   }
 
   // Job channel
-if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })) {
-  await ensureBotInChannel(jobChannelId);
-  try {
-    if (JOB_CHANNEL_STYLE === 'summary') {
-      const notice = buildJobChannelNotice({ activity, assigneeName });
-      await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
-    } else if (ENABLE_SLACK_PDF_UPLOAD) {
-      await uploadPdfToSlack({
-        channel: jobChannelId,
-        filename,
-        pdfBuffer,
-        title: `Work Order — ${activity.subject || ''}`,
-        initialComment: summary
-      });
-    }
-  } catch (e) {
-    console.error('[Slack upload failed][jobChannel]', e?.data || e?.message || e);
-  }
-}
-
-
-
-// Assignee channel
-if (assigneeChannelId) {
-  await ensureBotInChannel(assigneeChannelId);
-  if (ENABLE_DELETE_ON_REASSIGN) {
-    await deleteAssigneePost(activity.id);
-  }
-  if (ENABLE_SLACK_PDF_UPLOAD) {
+  if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })) {
+    await ensureBotInChannel(jobChannelId);
     try {
-      const up = await uploadPdfToSlack({
-        channel: assigneeChannelId,
-        filename,
-        pdfBuffer,
-        title: `Work Order — ${activity.subject || ''}`,
-        initialComment: summary
-      });
-
-      const fids = [];
-      if (up?.files && Array.isArray(up.files)) {
-        for (const f of up.files) if (f?.id) fids.push(f.id);
-      } else if (up?.file?.id) {
-        fids.push(up.file.id);
+      if (JOB_CHANNEL_STYLE === 'summary') {
+        const notice = buildJobChannelNotice({ activity, assigneeName });
+        await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
+      } else if (ENABLE_SLACK_PDF_UPLOAD) {
+        await uploadPdfToSlack({
+          channel: jobChannelId,
+          filename,
+          pdfBuffer,
+          title: `Work Order — ${activity.subject || ''}`,
+          initialComment: summary
+        });
+      } else {
+        // Fallback so something posts even if PDF uploads are disabled
+        const notice = buildJobChannelNotice({ activity, assigneeName });
+        await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
       }
-
-      const aMsgTs =
-        up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts ||
-        up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts ||
-        null;
-
-      ASSIGNEE_POSTS.set(String(activity.id), {
-        assigneeChannelId,
-        messageTs: aMsgTs,
-        fileIds: fids
-      });
     } catch (e) {
-      console.error('[Slack upload failed][assigneeChannel]', e?.data || e?.message || e);
+      console.error('[Slack upload failed][jobChannel]', e?.data || e?.message || e);
+    }
+  }
+
+  // Assignee channel
+  if (assigneeChannelId) {
+    await ensureBotInChannel(assigneeChannelId);
+    if (ENABLE_DELETE_ON_REASSIGN) {
+      await deleteAssigneePost(activity.id);
+    }
+    if (ENABLE_SLACK_PDF_UPLOAD) {
+      try {
+        const up = await uploadPdfToSlack({
+          channel: assigneeChannelId,
+          filename,
+          pdfBuffer,
+          title: `Work Order — ${activity.subject || ''}`,
+          initialComment: summary
+        });
+
+        const fids = [];
+        if (up?.files && Array.isArray(up.files)) {
+          for (const f of up.files) if (f?.id) fids.push(f.id);
+        } else if (up?.file?.id) {
+          fids.push(up.file.id);
+        }
+
+        const aMsgTs =
+          up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts ||
+          up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts ||
+          null;
+
+        ASSIGNEE_POSTS.set(String(activity.id), {
+          assigneeChannelId,
+          messageTs: aMsgTs,
+          fileIds: fids
+        });
+      } catch (e) {
+        console.error('[Slack upload failed][assigneeChannel]', e?.data || e?.message || e);
+      }
+    }
+  }
+
+  // Attach PDF to Pipedrive deal (optional)
+  if (ENABLE_PD_FILE_UPLOAD) {
+    try {
+      await uploadPdfToPipedrive({ dealId, pdfBuffer, filename });
+    } catch (e) {
+      console.error('[WO] PD upload failed:', e?.data || e?.message || e);
     }
   }
 }
-
 
 /* ========= Crew change notifier ========= */
 async function postCrewChangeNotice({ activity, deal, prevName, nextName }){
