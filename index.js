@@ -540,7 +540,22 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   }
 }
 
-/* ========= Assignee detection (enum + fallbacks) ========= */
+/* ========= Alias support for owner-name fallback ========= */
+/** Set CREW_NAME_ALIASES like: "anastasio:52, anastacio:52" */
+function parseNameAliases(raw=''){
+  const out = {};
+  for (const tok of raw.split(/[;,]/g).map(s=>s.trim()).filter(Boolean)){
+    const [k,v] = tok.split(':').map(s=>s.trim().toLowerCase());
+    if (!k || !v) continue;
+    if (/^\d+$/.test(v)) out[k] = Number(v);
+    else if (TEAM_NAME_TO_ID[v] != null) out[k] = TEAM_NAME_TO_ID[v];
+  }
+  // sensible defaults
+  if (out['anastasio'] == null) out['anastasio'] = 52;
+  return out;
+}
+const NAME_ALIAS_TO_ID = parseNameAliases(process.env.CREW_NAME_ALIASES || '');
+
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
 
 const TEAM_NAME_SET = new Set(
@@ -583,7 +598,7 @@ function probeActivityTeamId(activity){
  * Detects assignee/crew in this order:
  *   1) Activity-level Production Team enum (env key → deal key on activity → probe)
  *   2) Deal-level Production Team enum
- *   3) Activity owner / assigned user name
+ *   3) Activity owner / assigned user name (with alias fallback)
  *
  * Returns { teamId, teamName, channelId, _source }
  */
@@ -641,7 +656,7 @@ function detectAssignee({ deal, activity, allowDealFallback = false }) {
     }
   }
 
-  // 3) Fallback: infer from activity owner / assigned user
+  // 3) Fallback: infer from activity owner / assigned user, with alias
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -653,9 +668,23 @@ function detectAssignee({ deal, activity, allowDealFallback = false }) {
     null;
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
+
+  // exact match to team names
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: null, used: ownerName, owner: ownerName, source:'owner' });
-    return { teamId: null, teamName: ownerName, channelId: null, _source:'owner' };
+    const id = TEAM_NAME_TO_ID[ownerNameNorm] ?? null;
+    const teamName  = id != null ? (PRODUCTION_TEAM_MAP[id] || ownerName) : ownerName;
+    const channelId = id != null ? (PRODUCTION_TEAM_TO_CHANNEL[id] || null) : null;
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, source:'owner-exact', owner: ownerName, id });
+    return { teamId: id != null ? String(id) : null, teamName, channelId, _source:'owner' };
+  }
+
+  // alias lookup (e.g., "anastasio" -> 52)
+  const aliasId = NAME_ALIAS_TO_ID[ownerNameNorm];
+  if (aliasId != null) {
+    const teamName  = PRODUCTION_TEAM_MAP[aliasId] || `Team ${aliasId}`;
+    const channelId = PRODUCTION_TEAM_TO_CHANNEL[aliasId] || null;
+    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, source:'owner-alias', owner: ownerName, aliasId });
+    return { teamId: String(aliasId), teamName, channelId, _source:'owner-alias' };
   }
 
   if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: null, used: null, owner: activity?.owner_name || null, source:'none' });
@@ -1024,13 +1053,12 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const data = req.body?.data || req.body?.current || null;
 
     // Skip fanout when the webhook is only reflecting a subject rename
-const previous = req.body?.previous || null;
-const current  = req.body?.current  || data || null;
-if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous, current)) {
-  res.status(200).send('OK (subject-only update; skip fanout)');
-  return;
-}
-
+    const previous = req.body?.previous || null;
+    const current  = req.body?.current  || data || null;
+    if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous, current)) {
+      res.status(200).send('OK (subject-only update; skip fanout)');
+      return;
+    }
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
@@ -1127,15 +1155,16 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
       // 🚫 Blocked subjects never post
       if (isSubjectBlocked(activity.subject || '')) { res.status(200).send('OK'); return; }
 
-      // === SIMPLE DATE-ONLY GATE (today only) ===
+      // === DATE GATE: today only, or optional near-future window ===
       const _today = todayIsoCT();
-      const okByDate = isDueOnDate(activity, _today);
+      const okByDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS));
 
       console.log('[POST-GATE][activity]', {
         aid: activity.id,
         due_date: activity.due_date,
         today_ct: _today,
-        match_today: okByDate,
+        match_today: isDueOnDate(activity, _today),
+        window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
         dealActive: !deal || isDealActive(deal),
         subjectBlocked: isSubjectBlocked(activity.subject || '')
       });
@@ -1145,8 +1174,6 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
         res.status(200).send('OK');
         return;
       }
-
-      // No early-morning hold; date-only logic
 
       // Fingerprint dedup
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
@@ -1174,7 +1201,7 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1184,7 +1211,7 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1214,15 +1241,16 @@ if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous
           }
         } catch (e) { /* ignore */ }
 
-        // === SIMPLE DATE-ONLY GATE (today only) ===
+        // === DATE GATE: today only, or optional near-future window ===
         const _today = todayIsoCT();
-        const okDate = isDueOnDate(activity, _today);
+        const okDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS));
 
         console.log('[POST-GATE][deal-fanout]', {
           aid: activity.id,
           due_date: activity.due_date,
           today_ct: _today,
-          match_today: okDate,
+          match_today: isDueOnDate(activity, _today),
+          window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
           dealActive: isDealActive(deal),
           subjectBlocked: isSubjectBlocked(activity.subject || '')
         });
@@ -1291,7 +1319,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1403,13 +1431,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1439,7 +1467,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api/pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
+      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
@@ -1467,7 +1495,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1476,7 +1504,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1488,7 +1516,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
@@ -1511,13 +1539,13 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).json({ ok:false, error:'not found' });
     const activity = aJson.data;
     let deal = null;
     if (activity.deal_id) {
-      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: false });
@@ -1556,7 +1584,7 @@ expressApp.post('/debug/rename', express.json(), async (req, res) => {
   try {
     const { aid, to } = req.body || {};
     if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
     const cur = aJson.data.subject || '';
