@@ -24,12 +24,11 @@ const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID     = process.env.FORCE_CHANNEL_ID || null;
 const TZ = 'America/Chicago';
 
-// 👇 New: how to interpret Pipedrive due_time (your logs suggest UTC)
+// Treat PD due_time as UTC (or local) → normalize to CT
 const PD_DUE_TIME_TZ = (process.env.PD_DUE_TIME_TZ || 'utc').toLowerCase();
 
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
-const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 const POST_FUTURE_WOS           = process.env.POST_FUTURE_WOS === 'true';
@@ -48,88 +47,20 @@ function shouldPostToJobChannel({ assigneeChannelId }){
 // Job-channel content style: 'summary' | 'pdf'
 const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
-/* ===== Subject lists ===== */
+/* ===== Subject block list (optional) ===== */
 function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
-const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');   // (reserved)
-const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');  // used
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS'); // used
 
-function normalizeForInvoice(s=''){
-  return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
-}
-function subjectSansCrew(subject=''){
-  return String(subject).replace(/\s*[—-]\s*Crew:\s*[-A-Za-z' ]+$/i, '').trim();
-}
-function subjectMatchesList(subject, list){
-  const base = normalizeForInvoice(subjectSansCrew(subject || ''));
-  return list.some(s => normalizeForInvoice(s) === base);
-}
-
-/* ===== Subject renaming controls & debug ===== */
-const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
-const RENAME_FORMAT    = process.env.RENAME_FORMAT || 'append';
-const DEBUG_RENAME     = process.env.DEBUG_RENAME === 'true';
-const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
-
-// Extra debug verbosity for rename path
-const RENAME_DEBUG_LEVEL = Number(process.env.RENAME_DEBUG_LEVEL || (DEBUG_RENAME ? 2 : 0));
-function dbgRename(step, payload) {
-  if (!RENAME_DEBUG_LEVEL) return;
-  try { console.log(`[RENAME][${step}]`, JSON.stringify(payload)); }
-  catch { console.log(`[RENAME][${step}]`, payload); }
-}
-
-/* ========= Type-based gating ========= */
-const RENAME_TYPES_ALLOW = (process.env.RENAME_TYPES_ALLOW || '')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const RENAME_TYPES_BLOCK = (!process.env.RENAME_TYPES_ALLOW && process.env.RENAME_TYPES_BLOCK)
-  ? process.env.RENAME_TYPES_BLOCK.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  : [];
-
-/* ===== Crew chief auto-invite (optional) ===== */
-const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
-const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null; // optional PD field on Deal with email
-function parseChiefMap(raw=''){
-  const map = {};
-  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
-    const [name, idsRaw] = pair.split(':');
-    if (!name || !idsRaw) continue;
-    map[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
-  }
-  return map;
-}
-const TEAM_TO_CHIEF = parseChiefMap(process.env.CREW_CHIEF_MAP || '');
-
-function parseNameToSlackMap(raw=''){
-  const out = {};
-  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
-    const [name, idsRaw] = pair.split(':');
-    if (!name || !idsRaw) continue;
-    out[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
-  }
-  return out;
-}
-const CREW_CHIEF_NAME_TO_SLACK = parseNameToSlackMap(process.env.CREW_CHIEF_NAME_TO_SLACK || '');
-
-/* ===== Required envs ===== */
-if (!SLACK_SIGNING_SECRET) throw new Error('Missing SLACK_SIGNING_SECRET');
-if (!SLACK_BOT_TOKEN)      throw new Error('Missing SLACK_BOT_TOKEN');
-if (!PIPEDRIVE_API_TOKEN)  throw new Error('Missing PIPEDRIVE_API_TOKEN');
-if (!SIGNING_SECRET)       throw new Error('Missing WO_QR_SECRET');
-if (!BASE_URL)             throw new Error('Missing BASE_URL');
-if (!PD_WEBHOOK_KEY) console.warn('⚠️ PD_WEBHOOK_KEY not set; /pipedrive-task will 403.');
-
-// Crash handlers
-process.on('unhandledRejection', (r)=>console.error('[FATAL] Unhandled Rejection:', r?.stack||r));
-process.on('uncaughtException', (e)=>console.error('[FATAL] Uncaught Exception:', e?.stack||e));
+/* ========= General debug (off by default) ========= */
+const DEBUG = process.env.DEBUG === 'true';
+function dbg(tag, payload){ if (DEBUG) { try { console.log(`[${tag}]`, JSON.stringify(payload)); } catch { console.log(`[${tag}]`, payload); } } }
 
 /* ========= Event dedup (webhook loops) ========= */
 const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
-
 const EVENT_CACHE = new Map();           // key -> exp
 const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
-
 function makeEventKey(meta = {}, activity = {}) {
   const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
   const ts   = meta?.timestamp || meta?.time || '';
@@ -139,6 +70,7 @@ function makeEventKey(meta = {}, activity = {}) {
   const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
   return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
 }
+const DISABLE_EVENT_DEDUP = process.env.DISABLE_EVENT_DEDUP === 'true';
 function alreadyHandledEvent(meta, activity) {
   const key = makeEventKey(meta, activity);
   const now = Date.now();
@@ -151,31 +83,9 @@ function alreadyHandledEvent(meta, activity) {
   return false;
 }
 
-
-// ---- Subject-only change detector (skip fanout on rename webhooks) ----
-function _changedKeys(curr = {}, prev = {}) {
-  const keys = new Set([...Object.keys(curr || {}), ...Object.keys(prev || {})]);
-  const out = [];
-  for (const k of keys) {
-    const a = JSON.stringify(curr?.[k]);
-    const b = JSON.stringify(prev?.[k]);
-    if (a !== b) out.push(k);
-  }
-  return out;
-}
-function isSubjectOnlyUpdate(prev, curr) {
-  try {
-    if (!prev || !curr) return false;
-    const changed = _changedKeys(curr, prev);
-    return changed.length > 0 && changed.every(k => k === 'subject');
-  } catch { return false; }
-}
-
-
 /* ========= Post dedup (stop double PDFs) ========= */
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
-
 function htmlToPlainText(input=''){
   let s = String(input);
   s = s.replace(/<br\s*\/?>(\s)?/gi, '\n');
@@ -195,6 +105,19 @@ function noteHash(s=''){
   let h = 0; const str = htmlToPlainText(s||'').slice(0, 2000);
   for (let i=0;i<str.length;i++) { h = (h*31 + str.charCodeAt(i))|0; }
   return String(h);
+}
+function _normalizeTime(val){
+  if (val == null) return '';
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'object' && val.value != null) return String(val.value).trim();
+  if (typeof val === 'number') {
+    const secs = val > 300 ? val : val * 60;
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  return String(val).trim();
 }
 function makePostFingerprint({ activity, assigneeName, deal }) {
   const due    = `${activity?.due_date || ''} ${_normalizeTime(activity?.due_time)}`;
@@ -237,25 +160,6 @@ function isDealActive(deal){
 }
 
 /* ========= Date helpers ========= */
-function isBefore7amCTNow(){
-  const now = DateTime.now().setZone(TZ);
-  return now.hour < 7;
-}
-function _normalizeTime(val){
-  if (val == null) return '';
-  if (typeof val === 'string') return val.trim();
-  if (typeof val === 'object' && val.value != null) return String(val.value).trim();
-  if (typeof val === 'number') {
-    const secs = val > 300 ? val : val * 60;
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = Math.floor(secs % 60);
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  }
-  return String(val).trim();
-}
-
-// === SIMPLE date-only helpers ===
 function todayIsoCT() {
   return DateTime.now().setZone(TZ).toISODate();
 }
@@ -265,8 +169,6 @@ function tomorrowIsoCT() {
 function isDueOnDate(activity, isoDate) {
   return String(activity?.due_date || '').trim() === String(isoDate);
 }
-
-// Treat PD due_time as UTC (or local) → normalize to CT (kept for PDFs & sorting)
 function parseDueDateTimeCT(activity){
   const d = String(activity?.due_date || '').trim();
   const tRaw = _normalizeTime(activity?.due_time);
@@ -360,8 +262,20 @@ async function ensureBotInChannel(channelId) {
   catch (_e) { /* ignore join errors */ }
 }
 
-/* ========= Reassignment & completion tracking ========= */
+/* ========= Tracking ========= */
 const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
+const ASSIGNEE_CACHE = new Map(); // activityId -> lastSeenTeamName (string or null)
+const CREW_CHANGE_FP = new Map(); // key -> exp to debounce crew-change posts
+const CREW_FP_TTL_MS = Number(process.env.CREW_FP_TTL_MS || 5 * 60 * 1000);
+function shouldPostCrewChange(aid, prevName, nextName){
+  const key = `${aid}::${(prevName||'').toLowerCase()}→${(nextName||'').toLowerCase()}`;
+  const now = Date.now();
+  for (const [k, exp] of CREW_CHANGE_FP) if (!exp || exp <= now) CREW_CHANGE_FP.delete(k);
+  const exp = CREW_CHANGE_FP.get(key);
+  if (exp && exp > now) return false;
+  CREW_CHANGE_FP.set(key, now + CREW_FP_TTL_MS);
+  return true;
+}
 const AID_TAG = (id)=>`[AID:${id}]`;
 
 /* ========= Slack App ========= */
@@ -439,139 +353,18 @@ async function getBestLocation(deal){
   return dealAddr || 'N/A';
 }
 
-/* ========= Type gating ========= */
-function getActivityTypeKey(a){ return String(a?.type || '').toLowerCase().trim(); }
-function isTypeAllowedForRename(activity){
-  const t = getActivityTypeKey(activity);
-  if (!t) return true;
-  if (RENAME_TYPES_ALLOW.length) return RENAME_TYPES_ALLOW.includes(t);
-  if (RENAME_TYPES_BLOCK.length) return !RENAME_TYPES_BLOCK.includes(t);
-  return true;
-}
-
-/* ========= Subject renaming ========= */
-function normalizeCrewTag(name){
-  if (!name) return null;
-  const clean = String(name).trim().replace(/\s+/g,' ');
-  return `Crew: ${clean}`;
-}
-function extractCrewTag(subject){
-  if (!subject) return null;
-  const m = String(subject).match(/Crew:\s*([-A-Za-z' ]+)/i);
-  return m?.[0] || null;
-}
-function extractCrewName(subject){
-  const m = String(subject || '').match(/Crew:\s*([-A-Za-z' ]+)/i);
-  return m ? m[1].trim().toLowerCase().replace(/\s+/g,' ') : null;
-}
-function normalizeName(s){ return String(s || '').trim().toLowerCase(); }
-
-function buildRenamedSubject(original, assigneeName){
-  const crewTag = normalizeCrewTag(assigneeName);
-  if (!crewTag) return original || '';
-  const subj = String(original || '').trim();
-  const existing = extractCrewTag(subj);
-  if (existing) return subj.replace(/Crew:\s*([-A-Za-z' ]+)/i, crewTag);
-  if (RENAME_FORMAT === 'append') return subj ? `${subj} — ${crewTag}` : crewTag;
-  return subj ? `${subj} — ${crewTag}` : crewTag;
-}
-
-// ---- Stabilizer to fight subject reverts (e.g., PD workflow rewriting) ----
-const RENAME_STABILIZER = new Map(); // aid -> { wantCrew, wantSubject, until, tries }
-const RENAME_STABILIZE_WINDOW_MS = 6000;
-const RENAME_STABILIZE_MAX       = 3;
-function armRenameStabilizer(aid, wantCrew, wantSubject) {
-  const until = Date.now() + RENAME_STABILIZE_WINDOW_MS;
-  const prev  = RENAME_STABILIZER.get(String(aid)) || { tries:0 };
-  RENAME_STABILIZER.set(String(aid), { wantCrew, wantSubject, until, tries: prev.tries });
-}
-async function pdPutSubject(activityId, newSubject, attempts=2){
-  let last = null;
-  for (let i=0; i<attempts; i++){
-   const url = `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`;
-    const resp = await fetch(url, {
-      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject })
-    });
-    let j = null;
-    try { j = await resp.json(); } catch {}
-    if (resp.ok && j?.success) return j;
-
-    console.error('[RENAME][pd-put-failed]', {
-      aid: activityId, status: resp.status, ok: resp.ok, body: j
-    });
-
-    last = j;
-    if (resp.status === 429 || resp.status >= 500) { await new Promise(r=>setTimeout(r, 500)); continue; }
-    break;
-  }
-  return last || { success:false };
-}
-async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
-  const want = (assigneeName || '').trim();
-  if (!activityId || !want) return { did:false, reason:'no-assignee' };
-
-  const haveCrew = extractCrewName(currentSubject);
-  const wantCrew = normalizeName(want);
-
-  if (DEBUG_RENAME) {
-    console.log(`[RENAME] check id=${activityId} have=${haveCrew} want=${wantCrew} subj=${JSON.stringify(currentSubject)}`);
-  }
-
-  // Policy
-  if (RENAME_ON_ASSIGN === 'never') return { did:false, reason:'policy-never' };
-  if (RENAME_ON_ASSIGN === 'when_missing' && haveCrew) return { did:false, reason:'has-crew' };
-  if (haveCrew === wantCrew) return { did:false, reason:'already-correct' };
-
-  const newSubject = buildRenamedSubject(currentSubject || '', want);
-  if (!newSubject || newSubject === currentSubject) return { did:false, reason:'no-op' };
-
-  console.log(`[RENAME] PUT id=${activityId}: "${currentSubject}" -> "${newSubject}"`);
-  const putJ = await pdPutSubject(activityId, newSubject, 3);
-  if (!putJ?.success) return { did:false, reason:'pd-put-failed' };
-
-  // Fresh read to collapse races
-  try {
-    const a2 = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
-    const a2j = await a2.json();
-    const subjNow = a2j?.data?.subject || newSubject;
-    return { did:true, subject:subjNow };
-  } catch {
-    return { did:true, subject:newSubject };
-  }
-}
-
-/* ========= Alias support for owner-name fallback ========= */
-/** Set CREW_NAME_ALIASES like: "anastasio:52, anastacio:52" */
-function parseNameAliases(raw=''){
-  const out = {};
-  for (const tok of raw.split(/[;,]/g).map(s=>s.trim()).filter(Boolean)){
-    const [k,v] = tok.split(':').map(s=>s.trim().toLowerCase());
-    if (!k || !v) continue;
-    if (/^\d+$/.test(v)) out[k] = Number(v);
-    else if (TEAM_NAME_TO_ID[v] != null) out[k] = TEAM_NAME_TO_ID[v];
-  }
-  // sensible defaults
-  if (out['anastasio'] == null) out['anastasio'] = 52;
-  return out;
-}
-const NAME_ALIAS_TO_ID = parseNameAliases(process.env.CREW_NAME_ALIASES || '');
-
+/* ========= Assignee detection ========= */
 function readEnumId(v){ return (v && typeof v === 'object' && v.value != null) ? v.value : v; }
-
 const TEAM_NAME_SET = new Set(
   Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
 );
-
-// Probe all custom fields on the activity to find a Production Team enum by id or label
 function probeActivityTeamId(activity){
   if (!activity) return null;
   const VALID = new Set(Object.keys(PRODUCTION_TEAM_MAP).map(n => Number(n)));
   const norm = (s)=>String(s||'').trim().toLowerCase();
-
   for (const [key, val] of Object.entries(activity)){
     if (!/^[a-f0-9]{40}$/i.test(key)) continue; // PD custom-field keys look like 40-hex
     let id = null;
-
     if (val && typeof val === 'object') {
       if ('value' in val) {
         if (typeof val.value === 'number') id = val.value;
@@ -585,22 +378,50 @@ function probeActivityTeamId(activity){
     } else if (typeof val === 'string') {
       id = /^\d+$/.test(val) ? Number(val) : (TEAM_NAME_TO_ID[norm(val)] ?? null);
     }
-
     if (id != null && VALID.has(id)) {
-      dbgRename('activity-probe', { aid: activity?.id, keyUsed: key, resolvedId: String(id) });
+      dbg('activity-probe', { aid: activity?.id, keyUsed: key, resolvedId: String(id) });
       return { id, key };
     }
   }
   return null;
 }
+// Read a team name from an "activity-like" object (for webhook previous/current diffs)
+function readTeamFromActivityLike(obj){
+  if (!obj) return null;
+  const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
+  const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
+
+  const normalizeToId = (v)=>{
+    const raw = readEnumId(v);
+    if (raw != null) {
+      if (typeof raw === 'number') return raw;
+      if (typeof raw === 'string') return /^\d+$/.test(raw) ? Number(raw) : (TEAM_NAME_TO_ID[raw.trim().toLowerCase()] ?? null);
+    }
+    if (v && typeof v === 'object' && typeof v.label === 'string') {
+      const hit = TEAM_NAME_TO_ID[v.label.trim().toLowerCase()];
+      if (hit != null) return hit;
+    }
+    if (typeof v === 'string') {
+      return /^\d+$/.test(v) ? Number(v) : (TEAM_NAME_TO_ID[v.trim().toLowerCase()] ?? null);
+    }
+    return null;
+  };
+
+  let id = null;
+  if (ACTIVITY_TEAM_KEY) id = normalizeToId(obj[ACTIVITY_TEAM_KEY]);
+  if (id == null && DEAL_TEAM_KEY) id = normalizeToId(obj[DEAL_TEAM_KEY]);
+  if (id == null) {
+    const p = probeActivityTeamId(obj);
+    id = p?.id ?? null;
+  }
+  return id != null ? (PRODUCTION_TEAM_MAP[id] || `Team ${id}`) : null;
+}
 
 /**
- * Detects assignee/crew in this order:
- *   1) Activity-level Production Team enum (env key → deal key on activity → probe)
- *   2) Deal-level Production Team enum
- *   3) Activity owner / assigned user name (with alias fallback)
- *
- * Returns { teamId, teamName, channelId, _source }
+ * Detects assignee/crew:
+ *   1) Activity-level Production Team enum (explicit key → deal key on activity → probe)
+ *   2) Deal-level Production Team enum (disabled by default via allowDealFallback=false)
+ *   3) Activity owner / assigned user name (if it matches a team name)
  */
 function detectAssignee({ deal, activity, allowDealFallback = false }) {
   const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
@@ -623,40 +444,38 @@ function detectAssignee({ deal, activity, allowDealFallback = false }) {
   };
 
   // 1) Activity-level enum (explicit key → deal key on activity → probe)
-  let aTid = null, aKeyUsed = null;
-
+  let aTid = null;
   if (ACTIVITY_TEAM_KEY && activity) {
     const id = normalizeToId(activity[ACTIVITY_TEAM_KEY]);
-    if (id != null) { aTid = id; aKeyUsed = ACTIVITY_TEAM_KEY; }
+    if (id != null) aTid = id;
   }
   if (aTid == null && DEAL_TEAM_KEY && activity) {
     const id = normalizeToId(activity[DEAL_TEAM_KEY]);
-    if (id != null) { aTid = id; aKeyUsed = DEAL_TEAM_KEY; }
+    if (id != null) aTid = id;
   }
   if (aTid == null) {
     const p = probeActivityTeamId(activity);
-    if (p) { aTid = p.id; aKeyUsed = p.key; }
+    if (p) aTid = p.id;
   }
   if (aTid != null) {
     const teamName  = PRODUCTION_TEAM_MAP[aTid] || `Team ${aTid}`;
     const channelId = PRODUCTION_TEAM_TO_CHANNEL[aTid] || null;
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid:String(aTid), aKeyUsed, dTid:null, used:String(aTid), owner: activity?.owner_name || null, source:'activity' });
+    dbg('assign-source', { aid: activity?.id, source:'activity', id: aTid, teamName, channelId: !!channelId });
     return { teamId: String(aTid), teamName, channelId, _source:'activity' };
   }
 
-  // 2) Deal-level
-  let dTid = null;
+  // 2) Deal-level (optional)
   if (allowDealFallback && deal && DEAL_TEAM_KEY) {
-    dTid = normalizeToId(deal[DEAL_TEAM_KEY]) ?? null;
+    const dTid = normalizeToId(deal[DEAL_TEAM_KEY]) ?? null;
     if (dTid != null) {
       const teamName  = PRODUCTION_TEAM_MAP[dTid] || `Team ${dTid}`;
       const channelId = PRODUCTION_TEAM_TO_CHANNEL[dTid] || null;
-      if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: String(dTid), used: String(dTid), owner: activity?.owner_name || null, source:'deal' });
+      dbg('assign-source', { aid: activity?.id, source:'deal', id: dTid, teamName, channelId: !!channelId });
       return { teamId: String(dTid), teamName, channelId, _source:'deal' };
     }
   }
 
-  // 3) Fallback: infer from activity owner / assigned user, with alias
+  // 3) Fallback: infer from activity owner / assigned user if it exactly matches a team name
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -668,81 +487,23 @@ function detectAssignee({ deal, activity, allowDealFallback = false }) {
     null;
 
   const ownerNameNorm = String(ownerName || '').trim().toLowerCase();
-
-  // exact match to team names
   if (ownerName && TEAM_NAME_SET.has(ownerNameNorm)) {
     const id = TEAM_NAME_TO_ID[ownerNameNorm] ?? null;
     const teamName  = id != null ? (PRODUCTION_TEAM_MAP[id] || ownerName) : ownerName;
     const channelId = id != null ? (PRODUCTION_TEAM_TO_CHANNEL[id] || null) : null;
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, source:'owner-exact', owner: ownerName, id });
+    dbg('assign-source', { aid: activity?.id, source:'owner', owner: ownerName, id });
     return { teamId: id != null ? String(id) : null, teamName, channelId, _source:'owner' };
   }
 
-  // alias lookup (e.g., "anastasio" -> 52)
-  const aliasId = NAME_ALIAS_TO_ID[ownerNameNorm];
-  if (aliasId != null) {
-    const teamName  = PRODUCTION_TEAM_MAP[aliasId] || `Team ${aliasId}`;
-    const channelId = PRODUCTION_TEAM_TO_CHANNEL[aliasId] || null;
-    if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, source:'owner-alias', owner: ownerName, aliasId });
-    return { teamId: String(aliasId), teamName, channelId, _source:'owner-alias' };
-  }
-
-  if (RENAME_DEBUG_LEVEL) dbgRename('assign-source', { aid: activity?.id, aTid: null, aKeyUsed: null, dTid: null, used: null, owner: activity?.owner_name || null, source:'none' });
+  dbg('assign-source', { aid: activity?.id, source:'none', owner: activity?.owner_name || null });
   return { teamId: null, teamName: null, channelId: null, _source:'none' };
 }
 
 /* ========= Process gating helpers ========= */
-function baseSubject(s=''){ return String(s).replace(/\s*[—-]\s*Crew:\s*[-A-Za-z' ]+$/i, '').trim(); }
+function baseSubject(s=''){ return String(s).replace(/\s*[—-]\s*Crew:\s*[A-Za-z][A-Za-z ']*$/i, '').trim(); }
 const SUBJECT_BLOCK_SET = new Set(NEVER_PROCESS_SUBJECTS.map(s => s.toLowerCase()));
 function isSubjectBlocked(subject=''){
   return SUBJECT_BLOCK_SET.has(baseSubject(subject).toLowerCase());
-}
-
-// Track last-seen CT due (kept; not used by the simplified gates but safe to retain)
-const LAST_DUE_CACHE = new Map(); // aid -> { dateCT, timeCT, seenAt }
-const RECENT_UPDATE_WINDOW_SEC = Number(process.env.RECENT_UPDATE_WINDOW_SEC || 120);
-function markLastDue(aid, activity){
-  const { dt } = parseDueDateTimeCT(activity);
-  const dateCT = dt ? dt.toISODate() : (activity?.due_date||'').trim();
-  const timeCT = dt ? dt.toFormat('HH:mm:ss') : _normalizeTime(activity?.due_time||'');
-  LAST_DUE_CACHE.set(String(aid), { dateCT, timeCT, seenAt: Date.now() });
-  if (LAST_DUE_CACHE.size > 5000) {
-    const cutoff = Date.now() - 6*60*1000;
-    for (const [k,v] of LAST_DUE_CACHE) if (!v || v.seenAt < cutoff) LAST_DUE_CACHE.delete(k);
-  }
-}
-function movedIntoToday(aid, activity){
-  const prev = LAST_DUE_CACHE.get(String(aid));
-  if (!prev) return false;
-  const { dt } = parseDueDateTimeCT(activity);
-  if (!dt) return false;
-  const todayCT = DateTime.now().setZone(TZ).toISODate();
-  const nowDateCT = dt.toISODate();
-  return (nowDateCT === todayCT) && (prev.dateCT !== todayCT);
-}
-function wasJustTouched(activity){
-  const upd = activity?.update_time ? new Date(String(activity.update_time).replace(' ','T')) : null;
-  if (!upd || isNaN(upd)) return true; // if in doubt, allow
-  return (Date.now() - upd.getTime()) <= RECENT_UPDATE_WINDOW_SEC * 1000;
-}
-
-/* ========= Near-future window (opt-in) ========= */
-const FUTURE_POST_WINDOW_HOURS = Number(process.env.FUTURE_POST_WINDOW_HOURS || 0);
-function dueChangedFromLast(aid, activity){
-  const prev = LAST_DUE_CACHE.get(String(aid));
-  const { dt } = parseDueDateTimeCT(activity);
-  const curDateCT = dt ? dt.toISODate() : (activity?.due_date||'').trim();
-  const curTimeCT = dt ? dt.toFormat('HH:mm:ss') : _normalizeTime(activity?.due_time||'');
-  if (!prev) return true; // first observation after boot
-  return prev.dateCT !== curDateCT || prev.timeCT !== curTimeCT;
-}
-function isDueWithinWindowCT(activity, hours){
-  if (!hours) return false;
-  const { dt } = parseDueDateTimeCT(activity);
-  if (!dt) return false;
-  const now = DateTime.now().setZone(TZ);
-  const diffH = dt.diff(now, 'hours').hours;
-  return diffH >= 0 && diffH <= hours;
 }
 
 /* ========= PDF builders ========= */
@@ -860,7 +621,6 @@ function buildSummary({ activity, deal, assigneeName, noteText }){
   const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
   const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
   const subjNoCrew = stripCrewSuffix(activity.subject || '');
-
   return [
     `📌 Work Order • [JOB ${deal?.id || 'N/A'}] ${dealTitle} — ${subjNoCrew} — Crew: ${assigneeName || 'Unassigned'}`,
     `🏷️ Deal: ${dealId} — ${dealTitle}`,
@@ -878,29 +638,58 @@ function buildJobChannelNotice({ activity, assigneeName }){
     `📨 Work order delivered to ${who === 'Unassigned' ? 'assignee channel' : `*${who}*'s channel`}.`
   ].join('\n');
 }
+function buildCrewChangeNotice({ activity, deal, prev, next }){
+  const { dateLabel, timeLabel } = parseDueDateTimeCT(activity);
+  const header = `🔄 Crew Update • [JOB ${deal?.id || activity.deal_id || 'N/A'}] ${deal?.title || 'Untitled Deal'} — ${activity.subject || 'Task'} ${AID_TAG(activity.id)}`;
+  const lines = [
+    header,
+    `• Previous: ${prev || 'Unassigned'}`,
+    `• New: ${next || 'Unassigned'}`,
+    `• Due: ${dateLabel || '—'} ${timeLabel || ''}`.trim()
+  ];
+  return lines.join('\n');
+}
 
 /* ========= Invite helpers (optional) ========= */
+const INVITE_CREW_CHIEF = process.env.INVITE_CREW_CHIEF === 'true';
+const CREW_CHIEF_EMAIL_FIELD_KEY = process.env.CREW_CHIEF_EMAIL_FIELD_KEY || null;
+function parseChiefMap(raw=''){
+  const map = {};
+  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+    const [name, idsRaw] = pair.split(':');
+    if (!name || !idsRaw) continue;
+    map[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
+  }
+  return map;
+}
+const TEAM_TO_CHIEF = parseChiefMap(process.env.CREW_CHIEF_MAP || '');
+function parseNameToSlackMap(raw=''){
+  const out = {};
+  for (const pair of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+    const [name, idsRaw] = pair.split(':');
+    if (!name || !idsRaw) continue;
+    out[name.trim().toLowerCase()] = idsRaw.split('|').map(s=>s.trim()).filter(Boolean);
+  }
+  return out;
+}
+const CREW_CHIEF_NAME_TO_SLACK = parseNameToSlackMap(process.env.CREW_CHIEF_NAME_TO_SLACK || '');
 async function inviteUsersToChannel(channelId, userIds=[]){
   if (!channelId || !userIds.length) return;
-  try {
-    await app.client.conversations.invite({ channel: channelId, users: userIds.join(',') });
-  } catch (e) { /* ignore */ }
+  try { await app.client.conversations.invite({ channel: channelId, users: userIds.join(',') }); } catch (e) {}
 }
 async function resolveChiefSlackIds({ assigneeName, deal }){
   const out = new Set();
   const key = String(assigneeName || '').trim().toLowerCase();
   for (const id of (TEAM_TO_CHIEF[key] || [])) out.add(id);
   for (const id of (CREW_CHIEF_NAME_TO_SLACK[key] || [])) out.add(id);
-
   if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
     const email = (typeof deal[CREW_CHIEF_EMAIL_FIELD_KEY] === 'object' && deal[CREW_CHIEF_EMAIL_FIELD_KEY].value)
-      ? deal[CREW_CHIEF_EMAIL_FIELD_KEY].value
-      : deal?.[CREW_CHIEF_EMAIL_FIELD_KEY];
+      ? deal[CREW_CHIEF_EMAIL_FIELD_KEY].value : deal?.[CREW_CHIEF_EMAIL_FIELD_KEY];
     if (email && /@/.test(String(email))){
       try {
         const u = await app.client.users.lookupByEmail({ email: String(email).trim() });
         if (u?.user?.id) out.add(u.user.id);
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
     }
   }
   return [...out];
@@ -1010,6 +799,15 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e?.message||e); } }
 }
 
+/* ========= Crew change notifier ========= */
+async function postCrewChangeNotice({ activity, deal, prevName, nextName }){
+  const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
+  if (!jobChannelId) return;
+  await ensureBotInChannel(jobChannelId);
+  const text = buildCrewChangeNotice({ activity, deal, prev: prevName, next: nextName });
+  try { await app.client.chat.postMessage({ channel: jobChannelId, text }); } catch (e) {}
+}
+
 /* ========= Signed QR link ========= */
 const b64url = (b)=>Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 const sign = (raw)=>b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
@@ -1020,7 +818,6 @@ function verify(raw,sig){
     return crypto.timingSafeEqual(a,b);
   }catch{ return false; }
 }
-// ✅ trim trailing slashes on BASE_URL
 const cleanBase = ()=> String(BASE_URL||'').trim().replace(/\/+$/,'');
 
 function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
@@ -1051,14 +848,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
     const entity = rawEntity || 'unknown';
     const data = req.body?.data || req.body?.current || null;
-
-    // Skip fanout when the webhook is only reflecting a subject rename
     const previous = req.body?.previous || null;
-    const current  = req.body?.current  || data || null;
-    if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous, current)) {
-      res.status(200).send('OK (subject-only update; skip fanout)');
-      return;
-    }
 
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
@@ -1069,10 +859,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // de-dup incoming PD webhooks
       if (!DISABLE_EVENT_DEDUP && alreadyHandledEvent(meta, data)) {
-        dbgRename('skip-dedup', {
-          entity, action, aid: data?.id,
-          meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp }
-        });
+        dbg('skip-dedup', { entity, action, aid: data?.id, meta: { id: meta?.entity_id, req: meta?.request_id, ts: meta?.timestamp } });
         res.status(200).send('OK');
         return;
       }
@@ -1084,32 +871,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
       const activity = aJson.data;
-
-      // Stabilizer: if someone reverted our subject within the window, re-PUT up to 3x
-      try {
-        const stab = RENAME_STABILIZER.get(String(activity.id));
-        if (stab && Date.now() <= stab.until) {
-          if (stab.wantSubject && (activity.subject || '') !== stab.wantSubject && stab.tries < RENAME_STABILIZE_MAX) {
-            console.warn('[RENAME][stabilize] subject drift detected', {
-              aid: activity.id, have: activity.subject, want: stab.wantSubject, tries: stab.tries + 1
-            });
-            await pdPutSubject(activity.id, stab.wantSubject, 2);
-            RENAME_STABILIZER.set(String(activity.id), { ...stab, tries: stab.tries + 1 });
-          }
-        } else if (stab) {
-          RENAME_STABILIZER.delete(String(activity.id));
-        }
-      } catch (e) {
-        console.error('[RENAME][stabilize-error]', e?.message || e);
-      }
-
-      dbgRename('activity-fetched', {
-        id: activity.id, subject: activity.subject, due_date: activity.due_date, due_time: activity.due_time, done: activity.done
-      });
-
       if (activity.done === true || activity.done === 1) { res.status(200).send('OK'); return; }
 
-      // fetch the deal (so we can fall back to deal-level enum)
+      // fetch the deal (so we can post to channels / enrich PDF)
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
@@ -1118,64 +882,48 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
-      if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
       if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
 
-      // resolve assignee: prefer activity enum → deal fallback
+      // resolve assignee (crew)
       const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
         teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
       })}`);
-      dbgRename('assignee', assignee);
 
-      // ===== RENAME GATE =====
-      {
-        const typeAllowed = isTypeAllowedForRename(activity);
-        const hasTeam     = !!assignee.teamName;
-
-        if (typeAllowed && hasTeam) {
-          const curSubject = activity.subject || '';
-          const r = await ensureCrewTagMatches(activity.id, curSubject, assignee.teamName);
-          if (r?.did) {
-            const wantSubject = buildRenamedSubject(curSubject, assignee.teamName);
-            armRenameStabilizer(activity.id, assignee.teamName, wantSubject);
-            if (r.subject) activity.subject = r.subject;
-          }
-        } else {
-          dbgRename('rename-skipped', {
-            aid: activity.id,
-            reason: !typeAllowed ? 'type-blocked' : !hasTeam ? 'no-team' : 'other',
-            type: activity.type,
-            subject: activity.subject,
-            typeAllowed, hasTeam
-          });
-        }
-      }
-
-      // 🚫 Blocked subjects never post
-      if (isSubjectBlocked(activity.subject || '')) { res.status(200).send('OK'); return; }
-
-      // === DATE GATE: today only, or optional near-future window ===
+      // Gate by date (today or optional near-future window)
       const _today = todayIsoCT();
-      const okByDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS));
-
+      const okByDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, Number(process.env.FUTURE_POST_WINDOW_HOURS || 0)));
       console.log('[POST-GATE][activity]', {
         aid: activity.id,
         due_date: activity.due_date,
         today_ct: _today,
         match_today: isDueOnDate(activity, _today),
-        window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
+        window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, Number(process.env.FUTURE_POST_WINDOW_HOURS || 0)),
         dealActive: !deal || isDealActive(deal),
         subjectBlocked: isSubjectBlocked(activity.subject || '')
       });
 
+      if (isSubjectBlocked(activity.subject || '')) { res.status(200).send('OK'); return; }
+
+      // Crew-change announcement (compare webhook "previous" or cache vs current)
+      const prevFromWebhook = readTeamFromActivityLike(previous);
+      const prevFromCache   = ASSIGNEE_CACHE.get(String(activity.id)) ?? null;
+      const prevName        = prevFromWebhook ?? prevFromCache ?? null;
+      const nextName        = assignee.teamName ?? null;
+
+      if (prevName !== nextName && (prevName || nextName) && okByDate && shouldPostCrewChange(activity.id, prevName, nextName)) {
+        await postCrewChangeNotice({ activity, deal, prevName, nextName });
+      }
+      // Update cache
+      ASSIGNEE_CACHE.set(String(activity.id), nextName ?? null);
+
+      // WO posting (PDF to assignee channel; optional summary/PDF to job channel)
       if (!okByDate) {
         try { await deleteAssigneePost(activity.id); } catch {}
         res.status(200).send('OK');
         return;
       }
 
-      // Fingerprint dedup
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
         res.status(200).send('OK');
         return;
@@ -1193,7 +941,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       return;
     }
 
-    // ===== Deal update: re-assign/rename all open activities =====
+    // ===== Deal update: scan all OPEN activities for crew changes + WO posts =====
     if (entity === 'deal' && action === 'update') {
       const dealId = data?.id;
       if (!dealId) { res.status(200).send('No deal'); return; }
@@ -1201,7 +949,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1211,7 +959,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1219,53 +967,34 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
 
       for (const activity of items) {
-        // Capture crew from subject BEFORE potential rename to detect reassignment
-        const subjCrewBefore = extractCrewName(activity.subject || '');
+        if (isSubjectBlocked(activity.subject || '')) continue;
 
         const ass = detectAssignee({ deal, activity, allowDealFallback: false });
 
-        // Skip blocked subjects
-        if (isSubjectBlocked(activity.subject || '')) continue;
-
-        // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
-        try {
-          if (isTypeAllowedForRename(activity) && ass.teamName) {
-            const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
-            if (r?.did && r.subject) activity.subject = r.subject;
-          } else {
-            dbgRename('deal-update-gates', {
-              aid: activity.id,
-              typeAllowed: isTypeAllowedForRename(activity),
-              hasTeamName: !!ass.teamName
-            });
-          }
-        } catch (e) { /* ignore */ }
-
-        // === DATE GATE: today only, or optional near-future window ===
+        // Gate by date (today or optional window)
         const _today = todayIsoCT();
-        const okDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS));
-
+        const okDate = isDueOnDate(activity, _today) || (POST_FUTURE_WOS && isDueWithinWindowCT(activity, Number(process.env.FUTURE_POST_WINDOW_HOURS || 0)));
         console.log('[POST-GATE][deal-fanout]', {
           aid: activity.id,
           due_date: activity.due_date,
           today_ct: _today,
           match_today: isDueOnDate(activity, _today),
-          window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
+          window_ok: POST_FUTURE_WOS && isDueWithinWindowCT(activity, Number(process.env.FUTURE_POST_WINDOW_HOURS || 0)),
           dealActive: isDealActive(deal),
           subjectBlocked: isSubjectBlocked(activity.subject || '')
         });
 
+        // Crew-change via cache comparison
+        const prevCached = ASSIGNEE_CACHE.get(String(activity.id)) ?? null;
+        const nextName   = ass.teamName ?? null;
+        if (prevCached !== nextName && (prevCached || nextName) && okDate && shouldPostCrewChange(activity.id, prevCached, nextName)) {
+          await postCrewChangeNotice({ activity, deal, prevName: prevCached, nextName });
+        }
+        ASSIGNEE_CACHE.set(String(activity.id), nextName);
+
         if (!okDate) {
           try { await deleteAssigneePost(activity.id); } catch {}
           continue;
-        }
-
-        // If crew changed (based on subject tag vs detected team), allow posting even if not "just touched".
-        const crewChanged = subjCrewBefore && ass.teamName && normalizeName(subjCrewBefore) !== normalizeName(ass.teamName);
-
-        if (!crewChanged) {
-          // Not a reassignment -> only post if recently touched (throttles backlog on silent deal edits)
-          if (!wasJustTouched(activity)) continue;
         }
 
         if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
@@ -1286,7 +1015,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     if (entity === 'activity' && (action === 'delete')) {
       const id = data?.id || meta?.entity_id;
       console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
-      if (id) await deleteAssigneePost(id);
+      if (id) {
+        ASSIGNEE_CACHE.delete(String(id));
+        await deleteAssigneePost(id);
+      }
       res.status(200).send('OK');
       return;
     }
@@ -1326,18 +1058,10 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       if (deal && !isDealActive(deal)) continue;
 
       const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
-      const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
-
-      // Rename gate in 7AM run (idempotent)
-      try {
-        if (isTypeAllowedForRename(activity) && assignee.teamName) {
-          const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-          if (r?.did && r.subject) activity.subject = r.subject;
-        }
-      } catch {}
 
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
+      const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
       await postWorkOrderToChannels({
         activity, deal, jobChannelId,
         assigneeChannelId: assignee.channelId,
@@ -1381,15 +1105,6 @@ expressApp.get('/dispatch/run-tomorrow', async (_req, res) => {
 
       const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
 
-      // Light-touch rename (idempotent)
-      try {
-        if (isTypeAllowedForRename(activity) && assignee.teamName) {
-          const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
-          if (r?.did && r.subject) activity.subject = r.subject;
-        }
-      } catch {}
-
-      // Use fingerprint to avoid double-posts if you run this twice
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
@@ -1505,7 +1220,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     const dealId = data.deal_id;
     if (dealId){
       const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
-      const dj = await dRes.json();
+      const dj = await await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
         dealTitle = deal.title || 'N/A';
@@ -1535,7 +1250,6 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 });
 
 /* ========= Debug endpoints ========= */
-// Introspect what the app detects for an activity
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
@@ -1550,6 +1264,7 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: false });
     const parsed = parseDueDateTimeCT(activity);
+    const FUTURE_POST_WINDOW_HOURS = Number(process.env.FUTURE_POST_WINDOW_HOURS || 0);
     const gates = {
       ct_now_iso: DateTime.now().setZone(TZ).toISO(),
       ct_today: DateTime.now().setZone(TZ).toISODate(),
@@ -1559,9 +1274,8 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       ct_due_date: parsed.dt ? parsed.dt.toISODate() : null,
       ct_due_time: parsed.dt ? parsed.dt.toFormat('HH:mm:ss') : null,
       is_today: isDueTodayCT(activity),
-      into_today: movedIntoToday(activity.id, activity),
       due_in_window_h: FUTURE_POST_WINDOW_HOURS,
-      hits_window: isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
+      hits_window: POST_FUTURE_WOS && parsed.dt ? parsed.dt.diff(DateTime.now().setZone(TZ), 'hours').hours >= 0 && parsed.dt.diff(DateTime.now().setZone(TZ), 'hours').hours <= FUTURE_POST_WINDOW_HOURS : false,
       subject_blocked: isSubjectBlocked(activity.subject || ''),
       deal_active: !deal || isDealActive(deal)
     };
@@ -1574,24 +1288,6 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       source: ass?._source,
       gates
     });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e?.message || String(e) });
-  }
-});
-
-// Manual force-rename to a crew name: { aid, to }
-expressApp.post('/debug/rename', express.json(), async (req, res) => {
-  try {
-    const { aid, to } = req.body || {};
-    if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
-    const aJson = await aRes.json();
-    if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
-    const cur = aJson.data.subject || '';
-    const want = buildRenamedSubject(cur, to);
-    const put = await pdPutSubject(aid, want, 3);
-    armRenameStabilizer(aid, to, want);
-    res.status(200).json({ ok: !!put?.success, want, api: put });
   } catch (e) {
     res.status(500).json({ ok:false, error: e?.message || String(e) });
   }
