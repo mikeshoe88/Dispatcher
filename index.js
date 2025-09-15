@@ -29,7 +29,7 @@ const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'fal
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
-const POST_FUTURE_WOS           = process.env.POST_FUTURE_WOS === 'true';
+const POST_FUTURE_WOS           = process.env.POST_FUTURE_WOS === 'true'; // not honored by the hard gate below
 
 // Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
 const JOB_CHANNEL_MODE  = (process.env.JOB_CHANNEL_MODE || 'on_assigned').toLowerCase();
@@ -152,16 +152,16 @@ function alreadyHandledEvent(meta, activity) {
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
 
+function sha1_8(s){ return crypto.createHash('sha1').update(String(s||'')).digest('hex').slice(0,8); }
+
 function makePostFingerprint({ activity, assigneeName, deal }) {
-  const due    = `${activity?.due_date || ''} ${activity?.due_time || ''}`;
-  // strip the crew tag to avoid churn from renames; assignee is tracked separately
-  const subj   = subjectSansCrew(String(activity?.subject || ''));
+  const due    = `${activity?.due_date || ''} ${activity?.due_time || ''}`.trim();
+  const subj   = subjectSansCrew(activity?.subject || ''); // ignore crew suffix to avoid flapping
   const who    = String(assigneeName || '');
   const dealId = String(deal?.id || activity?.deal_id || '');
-  // include a short hash of normalized notes so scope/gate-code changes trigger a fresh post
-  const noteNorm = htmlToPlainText(activity?.note || '').replace(/\s+/g, ' ').trim();
-  const noteHash = crypto.createHash('sha256').update(noteNorm).digest('hex').slice(0, 10);
-  return `${subj}||${due}||${who}||${dealId}||n:${noteHash}`;
+  const note   = htmlToPlainText(activity?.note || '');
+  const noteH  = sha1_8(note); // changes to notes trigger one new post
+  return `${subj}||${due}||${who}||${dealId}||n:${noteH}`;
 }
 function shouldPostNowStrong(activity, assigneeName, deal) {
   const id = String(activity?.id || '');
@@ -201,6 +201,12 @@ function isDueTodayCT(activity){
   if (!d) return false;
   const today = DateTime.now().setZone(TZ).toISODate();
   return d === today;
+}
+function isFutureDateCT(activity){
+  const d = (activity?.due_date||'').trim();
+  if (!d) return false;
+  const today = DateTime.now().setZone(TZ).toISODate();
+  return d > today; // ISO dates lexically compare
 }
 function _normalizeTime(val){
   if (val == null) return '';
@@ -374,7 +380,7 @@ async function fetchOrganization(orgRef) {
     : orgRef;
   if (!orgId) return null;
   try{
-    const r = await fetch(`https://api.pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const r = await fetch(`https://api.pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const j = await r.json();
     return (j?.success && j.data) ? j.data : null;
   }catch{ return null; }
@@ -498,7 +504,7 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
 
   // Fresh read to collapse races
   try {
-    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const a2 = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const a2j = await a2.json();
     const subjNow = a2j?.data?.subject || newSubject;
     return { did:true, subject:subjNow };
@@ -703,8 +709,6 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
 /* ========= Delete helpers ========= */
 async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
   try{
-    // ensure we're in the channel so history/delete won't  'not_in_channel'
-    await ensureBotInChannel(channelId);
     const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
     for (const m of (h?.messages||[])){
       const text = (m.text||'') + ' ' + (m.previous_message?.text||'');
@@ -740,7 +744,7 @@ async function deleteAssigneePost(activityId){
 function stripCrewSuffix(s=''){
   return String(s).replace(/\s*[—-]\s*Crew:\s*[A-Za-z][A-Za-z ']*$/i, '').trim();
 }
-function buildSummary({ activity, deal, assigneeName, noteText }){
+function buildSummary({ activity, deal, assigneeName, noteText}){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
   const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
@@ -807,7 +811,7 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
   const form = new FormData();
   form.append('deal_id', String(dealId));
   form.append('file', pdfBuffer, { filename: filename || 'workorder.pdf', contentType: 'application/pdf' });
-  const resp = await fetch(`https://api.pipedrive.com/v1/files?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'POST', headers: form.getHeaders(), body: form });
+  const resp = await fetch(`https://api/pipedrive.com/v1/files?api_token=${PIPEDRIVE_API_TOKEN}`, { method:'POST', headers: form.getHeaders(), body: form });
   const j = await resp.json();
   if(!j?.success){ console.error('PD file upload failed:', j); throw new Error('PD file upload failed'); }
   return j;
@@ -945,7 +949,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // fetch the latest activity (include return_field_key to get raw keys)
       const aRes = await fetch(
-        `https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
@@ -980,7 +984,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
@@ -991,7 +995,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // resolve assignee: prefer activity enum → deal fallback
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
-        teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
+        teamName: assignee.teamName, teamId: assignee.teamId, channelId: assignee.channelId ? 'yes' : 'no'
       })}`);
       dbgRename('assignee', assignee);
 
@@ -1019,16 +1023,29 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         }
       }
 
-      // === Slack posting is gated by due date ===
-      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+      // === HARD GATE: only due today (CT) ===
+      if (!isDueTodayCT(activity)) {
+        if (isFutureDateCT(activity)) {
+          console.log('[WO] skip: future-due activity', { aid: activity.id, due_date: activity.due_date });
+        } else {
+          console.log('[WO] skip: not due today', { aid: activity.id, due_date: activity.due_date });
+        }
         try { await deleteAssigneePost(activity.id); } catch {}
         res.status(200).send('OK');
         return;
       }
+
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
         res.status(200).send('OK');
         return;
       }
+
+      console.log('[WO] posting', {
+        aid: activity.id,
+        due_date: activity.due_date,
+        due_time: activity.due_time,
+        assignee: assignee.teamName
+      });
 
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
       await postWorkOrderToChannels({
@@ -1050,7 +1067,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1060,7 +1077,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1085,13 +1102,23 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           }
         } catch (e) { /* ignore */ }
 
-        // Posting behavior: only due today (unless POST_FUTURE_WOS)
-        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+        // HARD GATE: only due today
+        if (!isDueTodayCT(activity)) {
+          if (isFutureDateCT(activity)) {
+            console.log('[WO] deal-fanout skip: future-due', { aid: activity.id, due_date: activity.due_date });
+          }
           try { await deleteAssigneePost(activity.id); } catch {}
           continue;
         }
 
         if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
+
+        console.log('[WO] posting', {
+          aid: activity.id,
+          due_date: activity.due_date,
+          due_time: activity.due_time,
+          assignee: ass.teamName
+        });
 
         await postWorkOrderToChannels({
           activity, deal, jobChannelId,
@@ -1128,7 +1155,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const listRes = await fetch(`https://api/pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
@@ -1138,7 +1165,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     for (const activity of dueToday) {
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1183,7 +1210,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     if (!verify(raw, sig)) { res.status(403).send('Bad signature.'); return; }
 
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
+    const pdResp = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
     });
@@ -1228,7 +1255,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
+      await fetch(`https://api/pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
@@ -1256,7 +1283,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1265,7 +1292,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1300,13 +1327,13 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).json({ ok:false, error:'not found' });
     const activity = aJson.data;
     let deal = null;
     if (activity.deal_id) {
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
@@ -1328,7 +1355,7 @@ expressApp.post('/debug/rename', express.json(), async (req, res) => {
   try {
     const { aid, to } = req.body || {};
     if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
     const cur = aJson.data.subject || '';
