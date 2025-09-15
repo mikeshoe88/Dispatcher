@@ -367,7 +367,9 @@ async function fetchOrganization(orgRef) {
     : orgRef;
   if (!orgId) return null;
   try{
-    const r = await fetch(`https://api.pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+    const r = await fetch(
+      `https://api/pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+    );
     const j = await r.json();
     return (j?.success && j.data) ? j.data : null;
   }catch{ return null; }
@@ -930,7 +932,8 @@ function verify(raw,sig){
     return crypto.timingSafeEqual(a,b);
   }catch{ return false; }
 }
-const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
+// ✅ fix: trim trailing slashes on BASE_URL
+const cleanBase = ()=> String(BASE_URL||'').trim().replace(/\/+$/,'');
 
 function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
   const exp = Math.floor(Date.now()/1000)+ttlSeconds;
@@ -1014,7 +1017,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
@@ -1100,7 +1103,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1110,7 +1113,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1195,7 +1198,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const listRes = await fetch(`https://api/pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
@@ -1207,7 +1210,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1252,7 +1255,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     if (!verify(raw, sig)) { res.status(403).send('Bad signature.'); return; }
 
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
+    const pdResp = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
     });
@@ -1261,13 +1264,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1325,7 +1328,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1334,7 +1337,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1346,7 +1349,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
@@ -1369,13 +1372,13 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).json({ ok:false, error:'not found' });
     const activity = aJson.data;
     let deal = null;
     if (activity.deal_id) {
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
@@ -1397,7 +1400,7 @@ expressApp.post('/debug/rename', express.json(), async (req, res) => {
   try {
     const { aid, to } = req.body || {};
     if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
     const cur = aJson.data.subject || '';
