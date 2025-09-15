@@ -158,17 +158,19 @@ function isDealActive(deal){
   if (deal.active_flag === false) return false;
   return true;
 }
-
 /* ========= Date helpers ========= */
 function todayIsoCT() {
   return DateTime.now().setZone(TZ).toISODate();
 }
+
 function tomorrowIsoCT() {
   return DateTime.now().setZone(TZ).plus({ days: 1 }).toISODate();
 }
+
 function isDueOnDate(activity, isoDate) {
   return String(activity?.due_date || '').trim() === String(isoDate);
 }
+
 function parseDueDateTimeCT(activity){
   const d = String(activity?.due_date || '').trim();
   const tRaw = _normalizeTime(activity?.due_time);
@@ -190,12 +192,27 @@ function parseDueDateTimeCT(activity){
     return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
   }
 }
+
 function isDueTodayCT(activity){
   const { dt } = parseDueDateTimeCT(activity);
   if (!dt) return false;
   const today = DateTime.now().setZone(TZ).toISODate();
   return dt.toISODate() === today;
 }
+
+// ✅ New: Returns true if the activity's CT due time is within the next `hours`
+function isDueWithinWindowCT(activity, hours){
+  const h = Number(hours || 0);
+  if (!h) return false;
+
+  const { dt } = parseDueDateTimeCT(activity);
+  if (!dt) return false;
+
+  const now = DateTime.now().setZone(TZ);
+  const diffH = dt.diff(now, 'hours').hours; // positive = in the future
+  return diffH >= 0 && diffH <= h;
+}
+
 function compareByStartTime(a, b){
   const pa = parseDueDateTimeCT(a);
   const pb = parseDueDateTimeCT(b);
@@ -204,6 +221,7 @@ function compareByStartTime(a, b){
   if (!pb.dt) return -1;
   return pa.dt.toMillis() - pb.dt.toMillis();
 }
+
 
 /* ========= Dictionaries ========= */
 const SERVICE_MAP = {
