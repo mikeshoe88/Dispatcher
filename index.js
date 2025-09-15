@@ -948,8 +948,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
       if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
 
-      // resolve assignee (crew)
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
+      // resolve assignee (crew)  ✅ enable deal fallback
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
         teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
       })}`);
@@ -1033,7 +1033,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       for (const activity of items) {
         if (isSubjectBlocked(activity.subject || '')) continue;
 
-        const ass = detectAssignee({ deal, activity, allowDealFallback: false });
+        // ✅ enable deal fallback
+        const ass = detectAssignee({ deal, activity, allowDealFallback: true });
 
         // Gate by date (today or optional window)
         const _today = todayIsoCT();
@@ -1121,7 +1122,8 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       }
       if (deal && !isDealActive(deal)) continue;
 
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
+      // ✅ enable deal fallback
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
 
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
@@ -1160,14 +1162,15 @@ expressApp.get('/dispatch/run-tomorrow', async (_req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
       if (deal && !isDealActive(deal)) continue;
 
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
+      // ✅ enable deal fallback
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
 
       if (!shouldPostNowStrong(activity, assignee.teamName, deal)) continue;
 
@@ -1291,7 +1294,8 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         const serviceId = readEnumId(deal?.['5b436b45b63857305f9691910b6567351b5517bc']);
         typeOfService = SERVICE_MAP[serviceId] || 'N/A';
         location = await getBestLocation(deal);
-        const ass = detectAssignee({ deal, activity: data, allowDealFallback: false });
+        // ✅ enable deal fallback
+        const ass = detectAssignee({ deal, activity: data, allowDealFallback: true });
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
@@ -1326,7 +1330,8 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
-    const ass = detectAssignee({ deal, activity, allowDealFallback: false });
+    // ✅ enable deal fallback
+    const ass = detectAssignee({ deal, activity, allowDealFallback: true });
     const parsed = parseDueDateTimeCT(activity);
     const FUTURE_POST_WINDOW_HOURS = Number(process.env.FUTURE_POST_WINDOW_HOURS || 0);
     const gates = {
