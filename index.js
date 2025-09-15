@@ -613,10 +613,11 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   }
 
   // 3) Fallback: infer from activity owner / assigned user
-  const userObj =
-    (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
-    (activity && typeof activity.assigned_to_user_id === 'object'] ? activity.assigned_to_user_id : null) ||
-    null;
+ const userObj =
+  (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
+  (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
+  null;
+
 
   const ownerName =
     (userObj && (userObj.name || userObj.email)) ||
