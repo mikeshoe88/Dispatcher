@@ -368,7 +368,7 @@ async function fetchOrganization(orgRef) {
   if (!orgId) return null;
   try{
     const r = await fetch(
-      `https://api/pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      `https://api.pipedrive.com/v1/organizations/${encodeURIComponent(orgId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
     );
     const j = await r.json();
     return (j?.success && j.data) ? j.data : null;
@@ -657,6 +657,24 @@ function wasJustTouched(activity){
   return (Date.now() - upd.getTime()) <= RECENT_UPDATE_WINDOW_SEC * 1000;
 }
 
+/* ========= Near-future window (opt-in) ========= */
+const FUTURE_POST_WINDOW_HOURS = Number(process.env.FUTURE_POST_WINDOW_HOURS || 0);
+function dueChangedFromLast(aid, activity){
+  const prev = LAST_DUE_CACHE.get(String(aid));
+  const curDate = (activity?.due_date||'').trim();
+  const curTime = _normalizeTime(activity?.due_time||'');
+  if (!prev) return true; // first observation after boot
+  return prev.date !== curDate || prev.time !== curTime;
+}
+function isDueWithinWindowCT(activity, hours){
+  if (!hours) return false;
+  const { dt } = parseDueDateTimeCT(activity);
+  if (!dt) return false;
+  const now = DateTime.now().setZone(TZ);
+  const diffH = dt.diff(now, 'hours').hours;
+  return diffH >= 0 && diffH <= hours;
+}
+
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
   const completeUrl = makeSignedCompleteUrl({ aid: String(activity.id), did: activity.deal_id ? String(activity.deal_id) : '', cid: channelForQR || DEFAULT_CHANNEL });
@@ -854,7 +872,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
-      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const pjson = await pres.json();
       if (pjson?.success && pjson.data) {
         customerName = pjson.data.name || null;
@@ -932,7 +950,7 @@ function verify(raw,sig){
     return crypto.timingSafeEqual(a,b);
   }catch{ return false; }
 }
-// ✅ fix: trim trailing slashes on BASE_URL
+// ✅ trim trailing slashes on BASE_URL
 const cleanBase = ()=> String(BASE_URL||'').trim().replace(/\/+$/,'');
 
 function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
@@ -1017,7 +1035,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
@@ -1056,22 +1074,40 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         }
       }
 
-      // Record due snapshot & detect FUTURE->TODAY
-      const intoToday = movedIntoToday(activity.id, activity);
+      // Record due snapshot & detect FUTURE->TODAY + near-future window
+      const didDueChange = dueChangedFromLast(activity.id, activity);
+      const intoToday    = movedIntoToday(activity.id, activity);
+      const dueInWindow  = isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS);
       markLastDue(activity.id, activity);
 
       // 🚫 Blocked subjects never post
       if (isSubjectBlocked(activity.subject || '')) { res.status(200).send('OK'); return; }
 
       // === Date/time gate ===
-      const okByDate = POST_FUTURE_WOS || isDueTodayCT(activity) || intoToday;
+      const okByDate = POST_FUTURE_WOS
+        || isDueTodayCT(activity)
+        || intoToday
+        || (didDueChange && dueInWindow);
+
+      console.log('[POST-GATE][activity]', {
+        aid: activity.id,
+        due: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+        today: isDueTodayCT(activity),
+        intoToday, didDueChange,
+        windowH: FUTURE_POST_WINDOW_HOURS,
+        windowHit: dueInWindow,
+        dealActive: !deal || isDealActive(deal),
+        subjectBlocked: isSubjectBlocked(activity.subject || ''),
+        okByDate
+      });
+
       if (!okByDate) {
         try { await deleteAssigneePost(activity.id); } catch {}
         res.status(200).send('OK');
         return;
       }
 
-      // Hold early-morning posts until 7am CT
+      // Hold early-morning posts until 7am CT for *today* only
       if (!POST_FUTURE_WOS && isDueTodayCT(activity) && isBefore7amCTNow()) {
         res.status(200).send('OK');
         return;
@@ -1143,15 +1179,36 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           }
         } catch (e) { /* ignore */ }
 
-        // Posting behavior: only due today (unless POST_FUTURE_WOS)
-        const okDate = POST_FUTURE_WOS || isDueTodayCT(activity);
+        // Posting behavior: due today OR moved-into-today OR near-future (on due change)
+        const didDueChange = dueChangedFromLast(activity.id, activity);
+        const intoToday    = movedIntoToday(activity.id, activity);
+        const dueInWindow  = isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS);
+        markLastDue(activity.id, activity);
+
+        const okDate = POST_FUTURE_WOS
+          || isDueTodayCT(activity)
+          || intoToday
+          || (didDueChange && dueInWindow);
+
+        console.log('[POST-GATE][deal-fanout]', {
+          aid: activity.id,
+          due: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+          today: isDueTodayCT(activity),
+          intoToday, didDueChange,
+          windowH: FUTURE_POST_WINDOW_HOURS,
+          windowHit: dueInWindow,
+          dealActive: isDealActive(deal),
+          subjectBlocked: isSubjectBlocked(activity.subject || ''),
+          okDate
+        });
+
         if (!okDate) {
           try { await deleteAssigneePost(activity.id); } catch {}
           continue;
         }
 
-        // Hold until 7am CT
-        if (!POST_FUTURE_WOS && isBefore7amCTNow()) continue;
+        // Hold until 7am CT for *today* items only
+        if (!POST_FUTURE_WOS && isDueTodayCT(activity) && isBefore7amCTNow()) continue;
 
         // If crew changed (based on subject tag vs detected team), allow posting even if not "just touched".
         const crewChanged = subjCrewBefore && ass.teamName && normalizeName(subjCrewBefore) !== normalizeName(ass.teamName);
@@ -1198,7 +1255,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api/pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
     const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
@@ -1382,6 +1439,18 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+    const gates = {
+      ct_now_iso: DateTime.now().setZone(TZ).toISO(),
+      ct_today: DateTime.now().setZone(TZ).toISODate(),
+      due_date: activity.due_date,
+      due_time: _normalizeTime(activity.due_time||''),
+      is_today: isDueTodayCT(activity),
+      into_today: movedIntoToday(activity.id, activity),
+      due_in_window_h: FUTURE_POST_WINDOW_HOURS,
+      hits_window: isDueWithinWindowCT(activity, FUTURE_POST_WINDOW_HOURS),
+      subject_blocked: isSubjectBlocked(activity.subject || ''),
+      deal_active: !deal || isDealActive(deal)
+    };
     res.json({
       ok: true,
       subject: activity.subject,
@@ -1389,6 +1458,7 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       due_time: activity.due_time,
       assignee: ass,
       source: ass?._source,
+      gates
     });
   } catch (e) {
     res.status(500).json({ ok:false, error: e?.message || String(e) });
