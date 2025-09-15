@@ -24,20 +24,20 @@ const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID     = process.env.FORCE_CHANNEL_ID || null;
 const TZ = 'America/Chicago';
 
-// Time interpretation for PD: by default PD returns date+time as UTC.
-const PD_TIME_MODE = (process.env.PD_TIME_MODE || 'utc').toLowerCase(); // 'utc' | 'local'
-
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
-const ENABLE_PD_NOTE            = false;
+const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
 const ENABLE_SLACK_PDF_UPLOAD   = process.env.ENABLE_SLACK_PDF_UPLOAD   !== 'false';
 const ENABLE_DELETE_ON_REASSIGN = process.env.ENABLE_DELETE_ON_REASSIGN !== 'false';
 const POST_FUTURE_WOS           = process.env.POST_FUTURE_WOS === 'true';
 
-// Webhook posting window (hold posts until morning)
-const WEBHOOK_POST_HOUR_START_CT = Number(process.env.WEBHOOK_POST_HOUR_START_CT || 7);
+// NEW: hold day-of posting until 7am CT
+const HOLD_UNTIL_7AM = process.env.HOLD_UNTIL_7AM !== 'false'; // default true
 
-// Job-channel posting behavior
+// NEW: correct time if PD returns UTC (set e.g. TIME_OFFSET_HOURS=-5)
+const TIME_OFFSET_HOURS = Number(process.env.TIME_OFFSET_HOURS || 0);
+
+// Job-channel posting behavior: 'immediate' | 'on_assigned' | 'on_complete'
 const JOB_CHANNEL_MODE  = (process.env.JOB_CHANNEL_MODE || 'on_assigned').toLowerCase();
 const JOB_CHANNEL_MODES = new Set(['immediate', 'on_assigned', 'on_complete']);
 function shouldPostToJobChannel({ assigneeChannelId }){
@@ -48,14 +48,14 @@ function shouldPostToJobChannel({ assigneeChannelId }){
   return true;
 }
 
-// Job-channel content style
+// Job-channel content style: 'summary' | 'pdf'
 const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCase();
 
 /* ===== Subject lists ===== */
 function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
-const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');  // (reserved)
+const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS'); // (reserved)
 const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS'); // (reserved)
 
 function normalizeForInvoice(s=''){
@@ -155,18 +155,18 @@ function alreadyHandledEvent(meta, activity) {
 }
 
 /* ========= Post dedup (stop double PDFs) ========= */
+// NEW: include a hash of the note so scope edits re-issue the WO
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
-
-const hashText = (s)=>crypto.createHash('sha1').update(String(s||'')).digest('hex').slice(0, 10);
+function sha1(s=''){ return crypto.createHash('sha1').update(String(s)).digest('hex').slice(0,12); }
 
 function makePostFingerprint({ activity, assigneeName, deal }) {
-  const { iso } = parseDueDateTimeCT(activity);
+  const due    = `${activity?.due_date || ''} ${activity?.due_time || ''}`;
   const subj   = String(activity?.subject || '');
   const who    = String(assigneeName || '');
   const dealId = String(deal?.id || activity?.deal_id || '');
-  const noteH  = hashText(activity?.note || '');
-  return `${subj}||${iso||''}||${who}||${dealId}||n:${noteH}`;
+  const noteH  = sha1(htmlToPlainText(activity?.note || ''));
+  return `${subj}||${due}||${who}||${dealId}||note:${noteH}`;
 }
 function shouldPostNowStrong(activity, assigneeName, deal) {
   const id = String(activity?.id || '');
@@ -201,6 +201,16 @@ function isDealActive(deal){
 }
 
 /* ========= Date helpers ========= */
+function isDueTodayCT(activity){
+  const d = (activity?.due_date||'').trim();
+  if (!d) return false;
+  const today = DateTime.now().setZone(TZ).toISODate();
+  return d === today;
+}
+function isBefore7amCT(){
+  const now = DateTime.now().setZone(TZ);
+  return now.hour < 7;
+}
 function _normalizeTime(val){
   if (val == null) return '';
   if (typeof val === 'string') return val.trim();
@@ -214,48 +224,27 @@ function _normalizeTime(val){
   }
   return String(val).trim();
 }
-
+// NEW: optional time offset for PD → local mismatch
 function parseDueDateTimeCT(activity){
   const d = String(activity?.due_date || '').trim();
-  const tRaw = _normalizeTime(activity?.due_time);
+  const tRaw0 = _normalizeTime(activity?.due_time);
   if (!d) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
 
-  const t = tRaw && /\d{1,2}:\d{2}/.test(tRaw)
-    ? (tRaw.length === 5 ? tRaw + ':00' : tRaw)
+  const tRaw = tRaw0 && /\d{1,2}:\d{2}/.test(tRaw0)
+    ? (tRaw0.length === 5 ? tRaw0 + ':00' : tRaw0)
     : '23:59:00';
 
-  try {
-    // If PD sends UTC (common), convert to CT; otherwise treat as CT already.
-    const base = DateTime.fromISO(`${d}T${t}`, { zone: PD_TIME_MODE === 'utc' ? 'UTC' : TZ });
-    const ct   = base.setZone(TZ);
-
-    if (!base.isValid || !ct.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
-
-    const dateLabel = ct.toFormat('MM/dd/yyyy');
-    const timeLabel = (activity?.due_time ? ct.toFormat('h:mm a') + ' CT' : '');
-    return { dt: ct, dateLabel, timeLabel, iso: ct.toISO() };
-  } catch {
+  try{
+    let dt = DateTime.fromISO(`${d}T${tRaw}`, { zone: TZ });
+    if (TIME_OFFSET_HOURS) dt = dt.plus({ hours: TIME_OFFSET_HOURS });
+    if (!dt.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+    const dateLabel = dt.toFormat('MM/dd/yyyy');
+    const timeLabel = tRaw0 ? (dt.toFormat('h:mm a') + ' CT') : '';
+    return { dt, dateLabel, timeLabel, iso: dt.toISO() };
+  }catch{
     return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
   }
 }
-
-function isDueTodayCT(activity){
-  const p = parseDueDateTimeCT(activity);
-  if (p.dt) {
-    const today = DateTime.now().setZone(TZ).toISODate();
-    return p.dt.toISODate() === today;
-  }
-  const d = (activity?.due_date||'').trim();
-  if (!d) return false;
-  const today = DateTime.now().setZone(TZ).toISODate();
-  return d === today;
-}
-
-function dueDateCT(activity){
-  const p = parseDueDateTimeCT(activity);
-  return p.dt ? p.dt.toISODate() : (activity?.due_date || '').trim();
-}
-
 function compareByStartTime(a, b){
   const pa = parseDueDateTimeCT(a);
   const pb = parseDueDateTimeCT(b);
@@ -263,15 +252,6 @@ function compareByStartTime(a, b){
   if (!pa.dt) return 1;
   if (!pb.dt) return -1;
   return pa.dt.toMillis() - pb.dt.toMillis();
-}
-
-function webhookWindowOpenFor(activity){
-  // Only allow webhook posting after 7:00 AM CT for tasks due *today*
-  if (!isDueTodayCT(activity)) return false;
-  const now = DateTime.now().setZone(TZ);
-  if (now.hour > WEBHOOK_POST_HOUR_START_CT) return true;
-  if (now.hour === WEBHOOK_POST_HOUR_START_CT) return true; // minute check optional
-  return false;
 }
 
 /* ========= Dictionaries ========= */
@@ -315,7 +295,7 @@ const PRODUCTION_TEAM_TO_CHANNEL = {
   58: 'C09EQNJN960', 59: null, 60: null
 };
 
-// 🔁 Name → ID
+// 🔁 Name → ID map
 const TEAM_NAME_TO_ID = Object.fromEntries(
   Object.entries(PRODUCTION_TEAM_MAP).map(([id, name]) => [String(name).trim().toLowerCase(), Number(id)])
 );
@@ -330,9 +310,16 @@ async function ensureBotInChannel(channelId) {
   try { await app.client.conversations.join({ channel: channelId }); }
   catch (_e) { /* ignore join errors */ }
 }
+function allCrewChannels(){
+  const set = new Set(Object.values(PRODUCTION_TEAM_TO_CHANNEL).filter(Boolean));
+  if (DEFAULT_CHANNEL) set.add(DEFAULT_CHANNEL);
+  if (FORCE_CHANNEL_ID) set.add(FORCE_CHANNEL_ID);
+  return [...set];
+}
 
 /* ========= Reassignment & completion tracking ========= */
-const ASSIGNEE_POSTS = new Map(); // activityId -> { assigneeChannelId, messageTs, fileIds: string[] }
+// NEW: track posts across multiple channels so we can delete everywhere
+const ACTIVITY_POSTS = new Map(); // activityId -> Array<{channelId, ts|null, fileIds:[]}>
 const AID_TAG = (id)=>`[AID:${id}]`;
 
 /* ========= Slack App ========= */
@@ -473,7 +460,7 @@ function buildRenamedSubject(original, assigneeName){
   return subj ? `${subj} — ${crewTag}` : crewTag;
 }
 
-// ---- Stabilizer ----
+// ---- Stabilizer (protect against PD reverts) ----
 const RENAME_STABILIZER = new Map(); // aid -> { wantCrew, wantSubject, until, tries }
 const RENAME_STABILIZE_WINDOW_MS = 6000;
 const RENAME_STABILIZE_MAX       = 3;
@@ -526,8 +513,9 @@ async function ensureCrewTagMatches(activityId, currentSubject, assigneeName) {
   const putJ = await pdPutSubject(activityId, newSubject, 3);
   if (!putJ?.success) return { did:false, reason:'pd-put-failed' };
 
+  // Fresh read to collapse races
   try {
-    const a2 = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const a2 = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const a2j = await a2.json();
     const subjNow = a2j?.data?.subject || newSubject;
     return { did:true, subject:subjNow };
@@ -543,13 +531,14 @@ const TEAM_NAME_SET = new Set(
   Object.values(PRODUCTION_TEAM_MAP).map(v => String(v || '').trim().toLowerCase()).filter(Boolean)
 );
 
+// Probe any custom enum
 function probeActivityTeamId(activity){
   if (!activity) return null;
   const VALID = new Set(Object.keys(PRODUCTION_TEAM_MAP).map(n => Number(n)));
   const norm = (s)=>String(s||'').trim().toLowerCase();
 
   for (const [key, val] of Object.entries(activity)){
-    if (!/^[a-f0-9]{40}$/i.test(key)) continue;
+    if (!/^[a-f0-9]{40}$/i.test(key)) continue; // PD custom fields look like 40-hex
     let id = null;
 
     if (val && typeof val === 'object') {
@@ -628,7 +617,7 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
     }
   }
 
-  // 3) Fallback: infer from activity owner name
+  // 3) Fallback: owner name
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
     (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
@@ -722,7 +711,9 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
 
 /* ========= Delete helpers ========= */
 async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
+  if (!channelId) return;
   try{
+    await ensureBotInChannel(channelId); // NEW: join before history
     const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
     for (const m of (h?.messages||[])){
       const text = (m.text||'') + ' ' + (m.previous_message?.text||'');
@@ -736,21 +727,28 @@ async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
     }
   }catch(e){ /* ignore */ }
 }
-async function deleteAssigneePost(activityId){
+async function deleteActivityPosts(activityId){
   const key = String(activityId);
-  const rec = ASSIGNEE_POSTS.get(key);
-  if (rec){
-    const { assigneeChannelId, messageTs, fileIds } = rec;
-    if (assigneeChannelId && messageTs){
-      try { await app.client.chat.delete({ channel: assigneeChannelId, ts: messageTs }); } catch (e){ /* ignore */ }
-      await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400);
-    } else if (assigneeChannelId) {
-      await deleteAssigneePdfByMarker(activityId, assigneeChannelId, 400);
+  const rec = ACTIVITY_POSTS.get(key);
+
+  // Known posts (same-process)
+  if (Array.isArray(rec) && rec.length){
+    for (const r of rec){
+      const { channelId, ts, fileIds=[] } = r || {};
+      try{
+        await ensureBotInChannel(channelId);
+        if (ts) { try{ await app.client.chat.delete({ channel: channelId, ts }); } catch{} }
+        await deleteAssigneePdfByMarker(activityId, channelId, 500);
+        for (const fid of fileIds){ try{ await app.client.files.delete({ file: fid }); } catch{} }
+      }catch{}
     }
-    if (Array.isArray(fileIds)){
-      for (const fid of fileIds){ if (!fid) continue; try { await app.client.files.delete({ file: fid }); } catch(e){} }
-    }
-    ASSIGNEE_POSTS.delete(key);
+    ACTIVITY_POSTS.delete(key);
+    return;
+  }
+
+  // Fallback sweep across known crew channels (after restart / no record)
+  for (const ch of allCrewChannels()){
+    await deleteAssigneePdfByMarker(activityId, ch, 500);
   }
 }
 
@@ -766,12 +764,12 @@ function buildSummary({ activity, deal, assigneeName, noteText }){
   const subjNoCrew = stripCrewSuffix(activity.subject || '');
 
   return [
-    `📌 Work Order • [JOB ${deal?.id || 'N/A'}] ${dealTitle} — ${subjNoCrew} — Crew: ${assigneeName || 'Unassigned'}`,
+    `📌 Work Order • [JOB ${deal?.id || 'N/A'}] ${dealTitle} — ${subjNoCrew} — Crew: ${assigneeName || 'Unassigned'} ${AID_TAG(activity.id)}`,
     `🏷️ Deal: ${dealId} — ${dealTitle}`,
     `📦 ${typeOfService}`,
     assigneeName ? `👷 ${assigneeName}` : null,
     noteText || activity.note ? `\n📜 Notes:\n${htmlToPlainText(noteText || activity.note)}` : null,
-    `\nScan the QR in the PDF to complete. ${AID_TAG(activity.id)}`
+    `\nScan the QR in the PDF to complete.`
   ].filter(Boolean).join('\n');
 }
 function buildJobChannelNotice({ activity, assigneeName }){
@@ -830,6 +828,12 @@ async function uploadPdfToPipedrive({ dealId, pdfBuffer, filename }){
   if(!j?.success){ console.error('PD file upload failed:', j); throw new Error('PD file upload failed'); }
   return j;
 }
+function trackPost(activityId, entry){
+  const key = String(activityId);
+  const arr = ACTIVITY_POSTS.get(key) || [];
+  arr.push(entry);
+  ACTIVITY_POSTS.set(key, arr);
+}
 async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeChannelId, assigneeName, noteText }){
   const dealId = activity.deal_id || (deal?.id ?? 'N/A');
   const dealTitle = deal?.title || 'N/A';
@@ -837,23 +841,17 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const typeOfService = SERVICE_MAP[serviceId] || 'N/A';
   const location = await getBestLocation(deal);
 
-  if (jobChannelId && assigneeChannelId && jobChannelId === assigneeChannelId) {
-    jobChannelId = null;
-  }
+  if (jobChannelId && assigneeChannelId && jobChannelId === assigneeChannelId) jobChannelId = null;
 
   let customerName = null;
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
-      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const pjson = await pres.json();
-      if (pjson?.success && pjson.data) {
-        customerName = pjson.data.name || null;
-      }
+      if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
     }
-  } catch (e) {
-    console.warn('[WO] person fetch failed', e?.message || e);
-  }
+  } catch (e) { console.warn('[WO] person fetch failed', e?.message || e); }
 
   const pdfBuffer = await buildWorkOrderPdfBuffer({
     activity,
@@ -870,6 +868,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   const filename = `WO_${safe(dealTitle)}_${safe(activity.subject)}.pdf`;
   const summary = buildSummary({ activity, deal, assigneeName, noteText });
 
+  // Invite chiefs (optional)
   if (INVITE_CREW_CHIEF && (jobChannelId || assigneeChannelId)){
     const inviteChannelId = assigneeChannelId || jobChannelId;
     await ensureBotInChannel(inviteChannelId);
@@ -879,21 +878,25 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
     } catch { /* ignore */ }
   }
 
+  // Job channel
   if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
     await ensureBotInChannel(jobChannelId);
     try {
       if (JOB_CHANNEL_STYLE === 'summary') {
         const notice = buildJobChannelNotice({ activity, assigneeName });
-        await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
+        const pm = await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
+        trackPost(activity.id, { channelId: jobChannelId, ts: pm?.ts || null, fileIds: [] });
       } else if (ENABLE_SLACK_PDF_UPLOAD) {
-        await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
+        const up = await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
+        trackPost(activity.id, { channelId: jobChannelId, ts: null, fileIds: (up?.files||[]).map(f=>f.id).filter(Boolean) });
       }
     } catch(e){ /* ignore */ }
   }
 
+  // Assignee channel
   if (assigneeChannelId){
     await ensureBotInChannel(assigneeChannelId);
-    if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
+    if (ENABLE_DELETE_ON_REASSIGN) { await deleteActivityPosts(activity.id); }
     if (ENABLE_SLACK_PDF_UPLOAD){
       try {
         const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
@@ -901,7 +904,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
         if (up?.files && Array.isArray(up.files)) { for (const f of up.files) if (f?.id) fids.push(f.id); }
         else if (up?.file?.id) { fids.push(up.file.id); }
         const aMsgTs = up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts || up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts || null;
-        ASSIGNEE_POSTS.set(String(activity.id), { assigneeChannelId, messageTs: aMsgTs, fileIds: fids });
+        trackPost(activity.id, { channelId: assigneeChannelId, ts: aMsgTs, fileIds: fids });
       } catch(e){ /* ignore */ }
     }
   }
@@ -920,6 +923,12 @@ function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
 }
 
 /* ========= Webhook ========= */
+function shouldPostTodayNow(activity){
+  if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) return false;
+  if (HOLD_UNTIL_7AM && isDueTodayCT(activity) && isBefore7amCT()) return false;
+  return true;
+}
+
 expressApp.post('/pipedrive-task', async (req, res) => {
   try {
     if (!PD_WEBHOOK_KEY || req.query.key !== PD_WEBHOOK_KEY) {
@@ -956,12 +965,14 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
 
       // fetch latest activity
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(
+        `https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+      );
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
       const activity = aJson.data;
 
-      // Stabilizer readback
+      // Stabilizer (subject drift)
       try {
         const stab = RENAME_STABILIZER.get(String(activity.id));
         if (stab && Date.now() <= stab.until) {
@@ -975,9 +986,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         } else if (stab) {
           RENAME_STABILIZER.delete(String(activity.id));
         }
-      } catch (e) {
-        console.error('[RENAME][stabilize-error]', e?.message || e);
-      }
+      } catch (e) { console.error('[RENAME][stabilize-error]', e?.message || e); }
 
       dbgRename('activity-fetched', {
         id: activity.id, subject: activity.subject, type: activity.type,
@@ -989,14 +998,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch the deal
       let deal = null;
       if (activity.deal_id) {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dRes = await fetch(
+          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
       if (deal) dbgRename('deal-fetched', { id: deal.id, status: deal.status });
       if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
 
-      // resolve assignee
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
         teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
@@ -1027,16 +1037,14 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         }
       }
 
-      // === Slack posting gates ===
-      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-        console.log('[WO] skip: future-due activity', { aid: activity.id, due_date: dueDateCT(activity) });
-        try { await deleteAssigneePost(activity.id); } catch {}
-        res.status(200).send('OK');
-        return;
-      }
-      // Hold until morning 7:00 AM CT for “due today” items via webhook
-      if (!webhookWindowOpenFor(activity)) {
-        console.log('[WO] skip: before-7am window', { aid: activity.id, due_date: dueDateCT(activity) });
+      // === Posting gates ===
+      if (!shouldPostTodayNow(activity)) {
+        if (ENABLE_DELETE_ON_REASSIGN) { try { await deleteActivityPosts(activity.id); } catch {} }
+        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+          console.log('[WO] skip: future-due activity', { aid: activity.id, due_date: activity.due_date });
+        } else if (HOLD_UNTIL_7AM && isBefore7amCT()) {
+          console.log('[WO] skip: before-7am window', { aid: activity.id, due_date: activity.due_date });
+        }
         res.status(200).send('OK');
         return;
       }
@@ -1062,9 +1070,10 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const dealId = data?.id;
       if (!dealId) { res.status(200).send('No deal'); return; }
 
+      // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1072,8 +1081,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
       deal = deal || data;
 
+      // list open activities
       const listRes = await fetch(
-        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1083,6 +1093,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       for (const activity of items) {
         const ass = detectAssignee({ deal, activity, allowDealFallback: true });
 
+        // rename
         try {
           if (isTypeAllowedForRename(activity) && ass.teamName) {
             const r = await ensureCrewTagMatches(activity.id, activity.subject || '', ass.teamName);
@@ -1097,13 +1108,9 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           }
         } catch (e) { /* ignore */ }
 
-        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
-          console.log('[WO] skip: future-due activity', { aid: activity.id, due_date: dueDateCT(activity) });
-          try { await deleteAssigneePost(activity.id); } catch {}
-          continue;
-        }
-        if (!webhookWindowOpenFor(activity)) {
-          console.log('[WO] skip: before-7am window', { aid: activity.id, due_date: dueDateCT(activity) });
+        // posting gates
+        if (!shouldPostTodayNow(activity)) {
+          if (ENABLE_DELETE_ON_REASSIGN) { try { await deleteActivityPosts(activity.id); } catch {} }
           continue;
         }
         if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
@@ -1123,8 +1130,8 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     // ===== Activity delete =====
     if (entity === 'activity' && (action === 'delete')) {
       const id = data?.id || meta?.entity_id;
-      console.log('[PD Hook] ACTIVITY delete id=%s → cleanup assignee post', id);
-      if (id) await deleteAssigneePost(id);
+      console.log('[PD Hook] ACTIVITY delete id=%s → cleanup posts', id);
+      if (id) await deleteActivityPosts(id);
       res.status(200).send('OK');
       return;
     }
@@ -1143,20 +1150,17 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
     const today = DateTime.now().setZone(TZ).toISODate();
-    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
-    const dueToday = all.filter(a => {
-      const p = parseDueDateTimeCT(a);
-      return p.dt ? p.dt.toISODate() === today : (a?.due_date||'').trim() === today;
-    });
+    const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
     dueToday.sort(compareByStartTime);
 
     let posted = 0;
     for (const activity of dueToday) {
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1165,6 +1169,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
 
+      // Rename gate in 7AM run (idempotent)
       try {
         if (isTypeAllowedForRename(activity) && assignee.teamName) {
           const r = await ensureCrewTagMatches(activity.id, activity.subject || '', assignee.teamName);
@@ -1200,7 +1205,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     if (!verify(raw, sig)) { res.status(403).send('Bad signature.'); return; }
 
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`, {
+    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
     });
@@ -1209,13 +1214,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1245,7 +1250,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     try {
       const when = new Date().toLocaleString();
       const subject = activity?.subject ? `“${activity.subject}”` : '';
-      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}` ,{
+      await fetch(`https://api.pipedrive.com/v1/notes?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.') ,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           deal_id: dealIdForUpload,
@@ -1254,7 +1259,7 @@ expressApp.get('/wo/complete', async (req, res) => {
       });
     } catch(e) { console.error('[WO] PD completion note failed', e?.message||e); }
 
-    await deleteAssigneePost(aid);
+    await deleteActivityPosts(aid);
 
     res.status(200).send(
       `<html><body style="font-family:Arial;padding:24px"><h2>Work Order Complete</h2>
@@ -1273,15 +1278,16 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
 
+    // Build WO PDF
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1293,7 +1299,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+          const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
@@ -1315,13 +1321,13 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).json({ ok:false, error:'not found' });
     const activity = aJson.data;
     let deal = null;
     if (activity.deal_id) {
-      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`);
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
@@ -1329,21 +1335,22 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       ok: true,
       subject: activity.subject,
       due_date: activity.due_date,
+      due_time: activity.due_time,
       type: activity.type,
       assignee: ass,
       source: ass?._source,
-      ct_due_iso: parseDueDateTimeCT(activity).iso
     });
   } catch (e) {
     res.status(500).json({ ok:false, error: e?.message || String(e) });
   }
 });
 
+// Manual force-rename to a crew name: { aid, to }
 expressApp.post('/debug/rename', express.json(), async (req, res) => {
   try {
     const { aid, to } = req.body || {};
     if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`);
+    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
     const cur = aJson.data.subject || '';
