@@ -152,35 +152,6 @@ function alreadyHandledEvent(meta, activity) {
 }
 
 
-/* ========= Event dedup (webhook loops) ========= */
-const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
-
-const EVENT_CACHE = new Map();           // key -> exp
-const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
-
-function makeEventKey(meta = {}, activity = {}) {
-  const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
-  const ts   = meta?.timestamp || meta?.time || '';
-  const req  = meta?.request_id || meta?.requestId || '';
-  const upd  = activity?.update_time || '';
-  const done = activity?.done ? '1' : '0';
-  const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
-  return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
-}
-function alreadyHandledEvent(meta, activity) {
-  const key = makeEventKey(meta, activity);
-  const now = Date.now();
-  const exp = EVENT_CACHE.get(key);
-  if (exp && exp > now) return true;
-  if (EVENT_CACHE.size > 5000) {
-    for (const [k, t] of EVENT_CACHE) if (t <= now) EVENT_CACHE.delete(k);
-  }
-  EVENT_CACHE.set(key, now + EVENT_CACHE_TTL_MS);
-  return false;
-}
-
-/* === ADD THIS NEW BLOCK BELOW (do NOT replace anything above) === */
-
 // ---- Subject-only change detector (skip fanout on rename webhooks) ----
 function _changedKeys(curr = {}, prev = {}) {
   const keys = new Set([...Object.keys(curr || {}), ...Object.keys(prev || {})]);
@@ -616,7 +587,7 @@ function probeActivityTeamId(activity){
  *
  * Returns { teamId, teamName, channelId, _source }
  */
-function detectAssignee({ deal, activity, allowDealFallback = true }) {
+function detectAssignee({ deal, activity, allowDealFallback = false }) {
   const ACTIVITY_TEAM_KEY = process.env.ACTIVITY_PRODUCTION_TEAM_FIELD_KEY || null;
   const DEAL_TEAM_KEY     = PRODUCTION_TEAM_FIELD_KEY;
 
