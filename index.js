@@ -24,6 +24,9 @@ const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID     = process.env.FORCE_CHANNEL_ID || null;
 const TZ = 'America/Chicago';
 
+// 👇 New: how to interpret Pipedrive due_time (your logs suggest UTC)
+const PD_DUE_TIME_TZ = (process.env.PD_DUE_TIME_TZ || 'utc').toLowerCase();
+
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
@@ -213,12 +216,6 @@ function isDealActive(deal){
 }
 
 /* ========= Date helpers ========= */
-function isDueTodayCT(activity){
-  const d = (activity?.due_date||'').trim();
-  if (!d) return false;
-  const today = DateTime.now().setZone(TZ).toISODate();
-  return d === today;
-}
 function isBefore7amCTNow(){
   const now = DateTime.now().setZone(TZ);
   return now.hour < 7;
@@ -236,6 +233,8 @@ function _normalizeTime(val){
   }
   return String(val).trim();
 }
+
+// 👇 Updated: treat PD due_time as UTC (or local) → normalize to CT
 function parseDueDateTimeCT(activity){
   const d = String(activity?.due_date || '').trim();
   const tRaw = _normalizeTime(activity?.due_time);
@@ -246,8 +245,10 @@ function parseDueDateTimeCT(activity){
     : '23:59:00';
 
   try{
-    const dt = DateTime.fromISO(`${d}T${t}`, { zone: TZ });
-    if (!dt.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+    const srcZone = (PD_DUE_TIME_TZ === 'utc') ? 'UTC' : TZ;
+    const src = DateTime.fromISO(`${d}T${t}`, { zone: srcZone });
+    if (!src.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
+    const dt = src.setZone(TZ);
     const dateLabel = dt.toFormat('MM/dd/yyyy');
     const timeLabel = tRaw ? (dt.toFormat('h:mm a') + ' CT') : '';
     return { dt, dateLabel, timeLabel, iso: dt.toISO() };
@@ -255,6 +256,15 @@ function parseDueDateTimeCT(activity){
     return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
   }
 }
+
+// 👇 Updated: compare CT-adjusted date (not raw PD date)
+function isDueTodayCT(activity){
+  const { dt } = parseDueDateTimeCT(activity);
+  if (!dt) return false;
+  const today = DateTime.now().setZone(TZ).toISODate();
+  return dt.toISODate() === today;
+}
+
 function compareByStartTime(a, b){
   const pa = parseDueDateTimeCT(a);
   const pb = parseDueDateTimeCT(b);
@@ -449,7 +459,7 @@ function armRenameStabilizer(aid, wantCrew, wantSubject) {
 async function pdPutSubject(activityId, newSubject, attempts=2){
   let last = null;
   for (let i=0; i<attempts; i++){
-    const url = `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`;
+    const url = `https://api/pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`;
     const resp = await fetch(url, {
       method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject })
     });
@@ -605,7 +615,7 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   // 3) Fallback: infer from activity owner / assigned user
   const userObj =
     (activity && typeof activity.user_id === 'object' ? activity.user_id : null) ||
-    (activity && typeof activity.assigned_to_user_id === 'object' ? activity.assigned_to_user_id : null) ||
+    (activity && typeof activity.assigned_to_user_id === 'object'] ? activity.assigned_to_user_id : null) ||
     null;
 
   const ownerName =
@@ -630,15 +640,14 @@ function isSubjectBlocked(subject=''){
   return SUBJECT_BLOCK_SET.has(baseSubject(subject).toLowerCase());
 }
 
-// Track last-seen due so a date-only change from FUTURE -> TODAY re-triggers once
-const LAST_DUE_CACHE = new Map(); // aid -> { date, time, seenAt }
+// 👇 Updated: track last-seen CT due to detect FUTURE→TODAY properly
+const LAST_DUE_CACHE = new Map(); // aid -> { dateCT, timeCT, seenAt }
 const RECENT_UPDATE_WINDOW_SEC = Number(process.env.RECENT_UPDATE_WINDOW_SEC || 120);
 function markLastDue(aid, activity){
-  LAST_DUE_CACHE.set(String(aid), {
-    date: (activity?.due_date||'').trim(),
-    time: _normalizeTime(activity?.due_time||''),
-    seenAt: Date.now()
-  });
+  const { dt } = parseDueDateTimeCT(activity);
+  const dateCT = dt ? dt.toISODate() : (activity?.due_date||'').trim();
+  const timeCT = dt ? dt.toFormat('HH:mm:ss') : _normalizeTime(activity?.due_time||'');
+  LAST_DUE_CACHE.set(String(aid), { dateCT, timeCT, seenAt: Date.now() });
   if (LAST_DUE_CACHE.size > 5000) {
     const cutoff = Date.now() - 6*60*1000;
     for (const [k,v] of LAST_DUE_CACHE) if (!v || v.seenAt < cutoff) LAST_DUE_CACHE.delete(k);
@@ -646,10 +655,12 @@ function markLastDue(aid, activity){
 }
 function movedIntoToday(aid, activity){
   const prev = LAST_DUE_CACHE.get(String(aid));
-  const nowIsToday = isDueTodayCT(activity);
   if (!prev) return false;
-  const prevWasToday = prev.date === DateTime.now().setZone(TZ).toISODate();
-  return nowIsToday && !prevWasToday;
+  const { dt } = parseDueDateTimeCT(activity);
+  if (!dt) return false;
+  const todayCT = DateTime.now().setZone(TZ).toISODate();
+  const nowDateCT = dt.toISODate();
+  return (nowDateCT === todayCT) && (prev.dateCT !== todayCT);
 }
 function wasJustTouched(activity){
   const upd = activity?.update_time ? new Date(String(activity.update_time).replace(' ','T')) : null;
@@ -661,10 +672,11 @@ function wasJustTouched(activity){
 const FUTURE_POST_WINDOW_HOURS = Number(process.env.FUTURE_POST_WINDOW_HOURS || 0);
 function dueChangedFromLast(aid, activity){
   const prev = LAST_DUE_CACHE.get(String(aid));
-  const curDate = (activity?.due_date||'').trim();
-  const curTime = _normalizeTime(activity?.due_time||'');
+  const { dt } = parseDueDateTimeCT(activity);
+  const curDateCT = dt ? dt.toISODate() : (activity?.due_date||'').trim();
+  const curTimeCT = dt ? dt.toFormat('HH:mm:ss') : _normalizeTime(activity?.due_time||'');
   if (!prev) return true; // first observation after boot
-  return prev.date !== curDate || prev.time !== curTime;
+  return prev.dateCT !== curDateCT || prev.timeCT !== curTimeCT;
 }
 function isDueWithinWindowCT(activity, hours){
   if (!hours) return false;
@@ -825,7 +837,7 @@ async function resolveChiefSlackIds({ assigneeName, deal }){
   if (CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY]){
     const email = (typeof deal[CREW_CHIEF_EMAIL_FIELD_KEY] === 'object' && deal[CREW_CHIEF_EMAIL_FIELD_KEY].value)
       ? deal[CREW_CHIEF_EMAIL_FIELD_KEY].value
-      : deal[CREW_CHIEF_EMAIL_FIELD_KEY];
+      : CREW_CHIEF_EMAIL_FIELD_KEY && deal?.[CREW_CHIEF_EMAIL_FIELD_KEY];
     if (email && /@/.test(String(email))){
       try {
         const u = await app.client.users.lookupByEmail({ email: String(email).trim() });
@@ -872,7 +884,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
-      const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const pjson = await pres.json();
       if (pjson?.success && pjson.data) {
         customerName = pjson.data.name || null;
@@ -1001,7 +1013,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // fetch the latest activity (include return_field_key to get raw keys)
       const aRes = await fetch(
-        `https://api/pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api.pipedrive.com/v1/activities/${encodeURIComponent(data.id)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const aJson = await aRes.json();
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
@@ -1035,7 +1047,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       let deal = null;
       if (activity.deal_id) {
         const dRes = await fetch(
-          `https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+          `https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
         );
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
@@ -1089,9 +1101,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         || intoToday
         || (didDueChange && dueInWindow);
 
+      const ct = parseDueDateTimeCT(activity);
       console.log('[POST-GATE][activity]', {
         aid: activity.id,
-        due: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+        due_raw: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+        due_ct_iso: ct.dt ? ct.dt.toISO() : null,
         today: isDueTodayCT(activity),
         intoToday, didDueChange,
         windowH: FUTURE_POST_WINDOW_HOURS,
@@ -1139,7 +1153,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1149,7 +1163,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1190,9 +1204,11 @@ expressApp.post('/pipedrive-task', async (req, res) => {
           || intoToday
           || (didDueChange && dueInWindow);
 
+        const ct = parseDueDateTimeCT(activity);
         console.log('[POST-GATE][deal-fanout]', {
           aid: activity.id,
-          due: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+          due_raw: `${activity.due_date} ${_normalizeTime(activity.due_time)}`,
+          due_ct_iso: ct.dt ? ct.dt.toISO() : null,
           today: isDueTodayCT(activity),
           intoToday, didDueChange,
           windowH: FUTURE_POST_WINDOW_HOURS,
@@ -1258,7 +1274,12 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
     const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
-    const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
+
+    // 👇 Updated: filter using CT-adjusted date (not raw PD date)
+    const dueToday = all.filter(a => {
+      const { dt } = parseDueDateTimeCT(a);
+      return dt && dt.toISODate() === today;
+    });
     dueToday.sort(compareByStartTime);
 
     let posted = 0;
@@ -1267,7 +1288,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
 
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1439,11 +1460,15 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+    const parsed = parseDueDateTimeCT(activity);
     const gates = {
       ct_now_iso: DateTime.now().setZone(TZ).toISO(),
       ct_today: DateTime.now().setZone(TZ).toISODate(),
-      due_date: activity.due_date,
-      due_time: _normalizeTime(activity.due_time||''),
+      due_date_raw: activity.due_date,
+      due_time_raw: _normalizeTime(activity.due_time||''),
+      ct_due_iso: parsed.dt ? parsed.dt.toISO() : null,
+      ct_due_date: parsed.dt ? parsed.dt.toISODate() : null,
+      ct_due_time: parsed.dt ? parsed.dt.toFormat('HH:mm:ss') : null,
       is_today: isDueTodayCT(activity),
       into_today: movedIntoToday(activity.id, activity),
       due_in_window_h: FUTURE_POST_WINDOW_HOURS,
