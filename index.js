@@ -768,36 +768,67 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   }
 
   // Job channel
-  if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })){
-    await ensureBotInChannel(jobChannelId);
-    try {
-      if (JOB_CHANNEL_STYLE === 'summary') {
-        const notice = buildJobChannelNotice({ activity, assigneeName });
-        await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
-      } else if (ENABLE_SLACK_PDF_UPLOAD) {
-        await uploadPdfToSlack({ channel: jobChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
-      }
-    } catch(e){ /* ignore */ }
+if (jobChannelId && isDealActive(deal) && shouldPostToJobChannel({ assigneeChannelId })) {
+  await ensureBotInChannel(jobChannelId);
+  try {
+    if (JOB_CHANNEL_STYLE === 'summary') {
+      const notice = buildJobChannelNotice({ activity, assigneeName });
+      await app.client.chat.postMessage({ channel: jobChannelId, text: notice });
+    } else if (ENABLE_SLACK_PDF_UPLOAD) {
+      await uploadPdfToSlack({
+        channel: jobChannelId,
+        filename,
+        pdfBuffer,
+        title: `Work Order — ${activity.subject || ''}`,
+        initialComment: summary
+      });
+    }
+  } catch (e) {
+    console.error('[Slack upload failed][jobChannel]', e?.data || e?.message || e);
   }
+}
 
-  // Assignee channel
-  if (assigneeChannelId){
-    await ensureBotInChannel(assigneeChannelId);
-    if (ENABLE_DELETE_ON_REASSIGN) { await deleteAssigneePost(activity.id); }
-    if (ENABLE_SLACK_PDF_UPLOAD){
-      try {
-        const up = await uploadPdfToSlack({ channel: assigneeChannelId, filename, pdfBuffer, title:`Work Order — ${activity.subject || ''}`, initialComment: summary });
-        const fids = [];
-        if (up?.files && Array.isArray(up.files)) { for (const f of up.files) if (f?.id) fids.push(f.id); }
-        else if (up?.file?.id) { fids.push(up.file.id); }
-        const aMsgTs = up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts || up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts || null;
-        ASSIGNEE_POSTS.set(String(activity.id), { assigneeChannelId, messageTs: aMsgTs, fileIds: fids });
-      } catch(e){ /* ignore */ }
+
+
+// Assignee channel
+if (assigneeChannelId) {
+  await ensureBotInChannel(assigneeChannelId);
+  if (ENABLE_DELETE_ON_REASSIGN) {
+    await deleteAssigneePost(activity.id);
+  }
+  if (ENABLE_SLACK_PDF_UPLOAD) {
+    try {
+      const up = await uploadPdfToSlack({
+        channel: assigneeChannelId,
+        filename,
+        pdfBuffer,
+        title: `Work Order — ${activity.subject || ''}`,
+        initialComment: summary
+      });
+
+      const fids = [];
+      if (up?.files && Array.isArray(up.files)) {
+        for (const f of up.files) if (f?.id) fids.push(f.id);
+      } else if (up?.file?.id) {
+        fids.push(up.file.id);
+      }
+
+      const aMsgTs =
+        up?.file?.shares?.public?.[assigneeChannelId]?.[0]?.ts ||
+        up?.file?.shares?.private?.[assigneeChannelId]?.[0]?.ts ||
+        null;
+
+      ASSIGNEE_POSTS.set(String(activity.id), {
+        assigneeChannelId,
+        messageTs: aMsgTs,
+        fileIds: fids
+      });
+    } catch (e) {
+      console.error('[Slack upload failed][assigneeChannel]', e?.data || e?.message || e);
     }
   }
-
-  if (ENABLE_PD_FILE_UPLOAD){ try{ await uploadPdfToPipedrive({ dealId, pdfBuffer, filename }); } catch(e){ console.error('[WO] PD upload failed:', e?.message||e); } }
 }
+
 
 /* ========= Crew change notifier ========= */
 async function postCrewChangeNotice({ activity, deal, prevName, nextName }){
