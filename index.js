@@ -151,6 +151,55 @@ function alreadyHandledEvent(meta, activity) {
   return false;
 }
 
+/* ========= Event dedup (webhook loops) ========= */
+const MAX_ACTIVITY_AGE_DAYS = Number(process.env.MAX_ACTIVITY_AGE_DAYS || 14);
+
+const EVENT_CACHE = new Map();           // key -> exp
+const EVENT_CACHE_TTL_MS = 60 * 1000;    // 60s
+
+function makeEventKey(meta = {}, activity = {}) {
+  const id   = activity?.id || meta?.id || meta?.entity_id || 'n/a';
+  const ts   = meta?.timestamp || meta?.time || '';
+  const req  = meta?.request_id || meta?.requestId || '';
+  const upd  = activity?.update_time || '';
+  const done = activity?.done ? '1' : '0';
+  const bucket = Math.floor(Date.now() / 10_000); // 10s bucket
+  return `aid:${id}|ts:${ts}|req:${req}|upd:${upd}|done:${done}|b:${bucket}`;
+}
+function alreadyHandledEvent(meta, activity) {
+  const key = makeEventKey(meta, activity);
+  const now = Date.now();
+  const exp = EVENT_CACHE.get(key);
+  if (exp && exp > now) return true;
+  if (EVENT_CACHE.size > 5000) {
+    for (const [k, t] of EVENT_CACHE) if (t <= now) EVENT_CACHE.delete(k);
+  }
+  EVENT_CACHE.set(key, now + EVENT_CACHE_TTL_MS);
+  return false;
+}
+
+/* === ADD THIS NEW BLOCK BELOW (do NOT replace anything above) === */
+
+// ---- Subject-only change detector (skip fanout on rename webhooks) ----
+function _changedKeys(curr = {}, prev = {}) {
+  const keys = new Set([...Object.keys(curr || {}), ...Object.keys(prev || {})]);
+  const out = [];
+  for (const k of keys) {
+    const a = JSON.stringify(curr?.[k]);
+    const b = JSON.stringify(prev?.[k]);
+    if (a !== b) out.push(k);
+  }
+  return out;
+}
+function isSubjectOnlyUpdate(prev, curr) {
+  try {
+    if (!prev || !curr) return false;
+    const changed = _changedKeys(curr, prev);
+    return changed.length > 0 && changed.every(k => k === 'subject');
+  } catch { return false; }
+}
+
+
 /* ========= Post dedup (stop double PDFs) ========= */
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
@@ -1002,6 +1051,15 @@ expressApp.post('/pipedrive-task', async (req, res) => {
     const entity = rawEntity || 'unknown';
     const data = req.body?.data || req.body?.current || null;
 
+    // Skip fanout when the webhook is only reflecting a subject rename
+const previous = req.body?.previous || null;
+const current  = req.body?.current  || data || null;
+if (entity === 'activity' && action === 'update' && isSubjectOnlyUpdate(previous, current)) {
+  res.status(200).send('OK (subject-only update; skip fanout)');
+  return;
+}
+
+
     console.log('[PD Hook] entity=%s action=%s id=%s', entity, action, data?.id || meta?.entity_id || 'n/a');
 
     // ===== Activity create/update =====
@@ -1064,7 +1122,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (deal && !isDealActive(deal)) { res.status(200).send('OK'); return; }
 
       // resolve assignee: prefer activity enum → deal fallback
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
       console.log(`[ASSIGNEE/ACT] id=${activity.id} -> ${JSON.stringify({
         teamName: assignee.teamName, teamId: assignee.teamId, channelId: !!assignee.channelId && 'yes'
       })}`);
@@ -1267,7 +1325,7 @@ expressApp.get('/dispatch/run-7am', async (_req, res) => {
       }
       if (deal && !isDealActive(deal)) continue;
 
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
 
       // Rename gate in 7AM run (idempotent)
@@ -1321,7 +1379,7 @@ expressApp.get('/dispatch/run-tomorrow', async (_req, res) => {
       }
       if (deal && !isDealActive(deal)) continue;
 
-      const assignee = detectAssignee({ deal, activity, allowDealFallback: true });
+      const assignee = detectAssignee({ deal, activity, allowDealFallback: false });
 
       // Light-touch rename (idempotent)
       try {
