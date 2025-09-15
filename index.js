@@ -488,7 +488,7 @@ function armRenameStabilizer(aid, wantCrew, wantSubject) {
 async function pdPutSubject(activityId, newSubject, attempts=2){
   let last = null;
   for (let i=0; i<attempts; i++){
-    const url = `https://api/pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`;
+   const url = `https://api.pipedrive.com/v1/activities/${encodeURIComponent(activityId)}?api_token=${PIPEDRIVE_API_TOKEN}`;
     const resp = await fetch(url, {
       method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ subject:newSubject })
     });
