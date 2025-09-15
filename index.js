@@ -24,10 +24,6 @@ const ALLOW_DEFAULT_FALLBACK = process.env.ALLOW_DEFAULT_FALLBACK !== 'false';
 const FORCE_CHANNEL_ID     = process.env.FORCE_CHANNEL_ID || null;
 const TZ = 'America/Chicago';
 
-// Treat Pipedrive activity due_date/due_time as UTC and convert to CT.
-// If you discover PD is already returning CT-native values, set PD_TIMES_ARE_UTC=false in env.
-const PD_TIMES_ARE_UTC = process.env.PD_TIMES_ARE_UTC !== 'false'; // default true
-
 // Feature toggles
 const ENABLE_PD_FILE_UPLOAD     = process.env.ENABLE_PD_FILE_UPLOAD     !== 'false';
 const ENABLE_PD_NOTE            = false; // only attach the WO PDF, no initial PD note
@@ -53,8 +49,8 @@ const JOB_CHANNEL_STYLE = (process.env.JOB_CHANNEL_STYLE || 'summary').toLowerCa
 function toSubjectListEnv(name){
   return (process.env[name] || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
-const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS'); // (reserved)
-const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS'); // (reserved)
+const NEVER_RENAME_SUBJECTS  = toSubjectListEnv('NEVER_RENAME_SUBJECTS');   // (reserved)
+const NEVER_PROCESS_SUBJECTS = toSubjectListEnv('NEVER_PROCESS_SUBJECTS');  // used
 
 function normalizeForInvoice(s=''){
   return String(s).toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
@@ -67,7 +63,7 @@ function subjectMatchesList(subject, list){
   return list.some(s => normalizeForInvoice(s) === base);
 }
 
-// ===== Subject renaming controls & debug =====
+/* ===== Subject renaming controls & debug ===== */
 const RENAME_ON_ASSIGN = (process.env.RENAME_ON_ASSIGN || 'always').toLowerCase(); // 'never' | 'when_missing' | 'always'
 const RENAME_FORMAT    = process.env.RENAME_FORMAT || 'append';
 const DEBUG_RENAME     = process.env.DEBUG_RENAME === 'true';
@@ -156,17 +152,33 @@ function alreadyHandledEvent(meta, activity) {
 const POST_FINGERPRINT = new Map(); // aid -> { fp, exp }
 const POST_FP_TTL_MS   = Number(process.env.POST_FP_TTL_MS || 10 * 60 * 1000); // default 10m
 
+function htmlToPlainText(input=''){
+  let s = String(input);
+  s = s.replace(/<br\s*\/?>(\s)?/gi, '\n');
+  s = s.replace(/<\/?p[^>]*>/gi, '\n');
+  s = s.replace(/<\/li>\s*<li[^>]*>/gi, '\n• ');
+  s = s.replace(/<li[^>]*>/gi, '• ');
+  s = s.replace(/<\/li>/gi, '');
+  s = s.replace(/<\/?ul[^>]*>/gi, '\n');
+  s = s.replace(/<\/?ol[^>]*>/gi, '\n');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+       .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  s = s.replace(/\n{3,}/g, '\n\n').trim();
+  return s;
+}
+function noteHash(s=''){
+  let h = 0; const str = htmlToPlainText(s||'').slice(0, 2000);
+  for (let i=0;i<str.length;i++) { h = (h*31 + str.charCodeAt(i))|0; }
+  return String(h);
+}
 function makePostFingerprint({ activity, assigneeName, deal }) {
-  const due    = `${activity?.due_date || ''} ${activity?.due_time || ''}`;
+  const due    = `${activity?.due_date || ''} ${_normalizeTime(activity?.due_time)}`;
   const subj   = String(activity?.subject || '');
   const who    = String(assigneeName || '');
   const dealId = String(deal?.id || activity?.deal_id || '');
-
-  // include a tiny hash of the normalized notes so scope edits trigger a fresh post
-  const noteNorm = htmlToPlainText(activity?.note || '').replace(/\s+/g,' ').trim();
-  const noteHash = crypto.createHash('sha1').update(noteNorm).digest('hex').slice(0,8);
-
-  return `${subj}||${due}||${who}||${dealId}||n:${noteHash}`;
+  const nh     = noteHash(activity?.note||'');
+  return `${subj}||${due}||${who}||${dealId}||nh:${nh}`;
 }
 function shouldPostNowStrong(activity, assigneeName, deal) {
   const id = String(activity?.id || '');
@@ -201,6 +213,16 @@ function isDealActive(deal){
 }
 
 /* ========= Date helpers ========= */
+function isDueTodayCT(activity){
+  const d = (activity?.due_date||'').trim();
+  if (!d) return false;
+  const today = DateTime.now().setZone(TZ).toISODate();
+  return d === today;
+}
+function isBefore7amCTNow(){
+  const now = DateTime.now().setZone(TZ);
+  return now.hour < 7;
+}
 function _normalizeTime(val){
   if (val == null) return '';
   if (typeof val === 'string') return val.trim();
@@ -224,12 +246,7 @@ function parseDueDateTimeCT(activity){
     : '23:59:00';
 
   try{
-    // PD reports UTC → convert to CT (configurable)
-    const base = PD_TIMES_ARE_UTC
-      ? DateTime.fromISO(`${d}T${t}`, { zone: 'utc' })
-      : DateTime.fromISO(`${d}T${t}`, { zone: TZ });
-
-    const dt = base.setZone(TZ);
+    const dt = DateTime.fromISO(`${d}T${t}`, { zone: TZ });
     if (!dt.isValid) return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
     const dateLabel = dt.toFormat('MM/dd/yyyy');
     const timeLabel = tRaw ? (dt.toFormat('h:mm a') + ' CT') : '';
@@ -237,13 +254,6 @@ function parseDueDateTimeCT(activity){
   }catch{
     return { dt:null, dateLabel:'', timeLabel:'', iso:'' };
   }
-}
-function isDueTodayCT(activity){
-  const { dt } = parseDueDateTimeCT(activity);
-  const today = DateTime.now().setZone(TZ).startOf('day');
-  if (dt) return dt.hasSame(today, 'day');
-  const d = (activity?.due_date||'').trim();
-  return d === today.toISODate();
 }
 function compareByStartTime(a, b){
   const pa = parseDueDateTimeCT(a);
@@ -291,8 +301,8 @@ const DEAL_ADDRESS_KEY          = process.env.DEAL_ADDRESS_KEY || 'd204334da759b
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
   47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09ASBE36Q7', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
-  52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE', 57: 'C09B85LE544',
-  58: 'C09EQNJN960', 59: null, 60: null
+  52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE',
+  57: 'C09B85LE544', 58: 'C09EQNJN960', 59: null, 60: null
 };
 
 // 🔁 Name → ID map (to resolve label-only enum values)
@@ -332,34 +342,6 @@ const expressApp = receiver.app;
 expressApp.use(express.json());
 expressApp.get('/', (_req,res)=>res.status(200).send('Dispatcher OK'));
 expressApp.get('/healthz', (_req,res)=>res.status(200).send('ok'));
-
-/* ========= Helpers ========= */
-const b64url = (b)=>Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-const sign = (raw)=>b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
-function verify(raw,sig){
-  try{
-    const a=Buffer.from(sign(raw)), b=Buffer.from(String(sig));
-    if(a.length!==b.length) return false;
-    return crypto.timingSafeEqual(a,b);
-  }catch{ return false; }
-}
-const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
-
-function htmlToPlainText(input=''){
-  let s = String(input);
-  s = s.replace(/<br\s*\/?>(\s)?/gi, '\n');
-  s = s.replace(/<\/?p[^>]*>/gi, '\n');
-  s = s.replace(/<\/li>\s*<li[^>]*>/gi, '\n• ');
-  s = s.replace(/<li[^>]*>/gi, '• ');
-  s = s.replace(/<\/li>/gi, '');
-  s = s.replace(/<\/?ul[^>]*>/gi, '\n');
-  s = s.replace(/<\/?ol[^>]*>/gi, '\n');
-  s = s.replace(/<[^>]+>/g, '');
-  s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
-       .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-  s = s.replace(/\n{3,}/g, '\n\n').trim();
-  return s;
-}
 
 /* ========= Address helpers ========= */
 function _fmt(parts) {
@@ -462,7 +444,6 @@ function armRenameStabilizer(aid, wantCrew, wantSubject) {
   const prev  = RENAME_STABILIZER.get(String(aid)) || { tries:0 };
   RENAME_STABILIZER.set(String(aid), { wantCrew, wantSubject, until, tries: prev.tries });
 }
-
 async function pdPutSubject(activityId, newSubject, attempts=2){
   let last = null;
   for (let i=0; i<attempts; i++){
@@ -640,6 +621,40 @@ function detectAssignee({ deal, activity, allowDealFallback = true }) {
   return { teamId: null, teamName: null, channelId: null, _source:'none' };
 }
 
+/* ========= Process gating helpers ========= */
+function baseSubject(s=''){ return String(s).replace(/\s*[—-]\s*Crew:\s*[-A-Za-z' ]+$/i, '').trim(); }
+const SUBJECT_BLOCK_SET = new Set(NEVER_PROCESS_SUBJECTS.map(s => s.toLowerCase()));
+function isSubjectBlocked(subject=''){
+  return SUBJECT_BLOCK_SET.has(baseSubject(subject).toLowerCase());
+}
+
+// Track last-seen due so a date-only change from FUTURE -> TODAY re-triggers once
+const LAST_DUE_CACHE = new Map(); // aid -> { date, time, seenAt }
+const RECENT_UPDATE_WINDOW_SEC = Number(process.env.RECENT_UPDATE_WINDOW_SEC || 120);
+function markLastDue(aid, activity){
+  LAST_DUE_CACHE.set(String(aid), {
+    date: (activity?.due_date||'').trim(),
+    time: _normalizeTime(activity?.due_time||''),
+    seenAt: Date.now()
+  });
+  if (LAST_DUE_CACHE.size > 5000) {
+    const cutoff = Date.now() - 6*60*1000;
+    for (const [k,v] of LAST_DUE_CACHE) if (!v || v.seenAt < cutoff) LAST_DUE_CACHE.delete(k);
+  }
+}
+function movedIntoToday(aid, activity){
+  const prev = LAST_DUE_CACHE.get(String(aid));
+  const nowIsToday = isDueTodayCT(activity);
+  if (!prev) return false;
+  const prevWasToday = prev.date === DateTime.now().setZone(TZ).toISODate();
+  return nowIsToday && !prevWasToday;
+}
+function wasJustTouched(activity){
+  const upd = activity?.update_time ? new Date(String(activity.update_time).replace(' ','T')) : null;
+  if (!upd || isNaN(upd)) return true; // if in doubt, allow
+  return (Date.now() - upd.getTime()) <= RECENT_UPDATE_WINDOW_SEC * 1000;
+}
+
 /* ========= PDF builders ========= */
 async function buildWorkOrderPdfBuffer({ activity, dealTitle, typeOfService, location, channelForQR, assigneeName, customerName, jobNumber }) {
   const completeUrl = makeSignedCompleteUrl({ aid: String(activity.id), did: activity.deal_id ? String(activity.deal_id) : '', cid: channelForQR || DEFAULT_CHANNEL });
@@ -714,7 +729,6 @@ function buildCompletionPdfBuffer({ activity, dealTitle, typeOfService, location
 /* ========= Delete helpers ========= */
 async function deleteAssigneePdfByMarker(activityId, channelId, lookback=400){
   try{
-    await ensureBotInChannel(channelId); // ensure we can see/delete
     const h = await app.client.conversations.history({ channel: channelId, limit: lookback, inclusive: true });
     for (const m of (h?.messages||[])){
       const text = (m.text||'') + ' ' + (m.previous_message?.text||'');
@@ -838,7 +852,7 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
   try {
     const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
     if (pid) {
-      const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const pjson = await pres.json();
       if (pjson?.success && pjson.data) {
         customerName = pjson.data.name || null;
@@ -907,6 +921,17 @@ async function postWorkOrderToChannels({ activity, deal, jobChannelId, assigneeC
 }
 
 /* ========= Signed QR link ========= */
+const b64url = (b)=>Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const sign = (raw)=>b64url(crypto.createHmac('sha256', SIGNING_SECRET).update(raw).digest());
+function verify(raw,sig){
+  try{
+    const a=Buffer.from(sign(raw)), b=Buffer.from(String(sig));
+    if(a.length!==b.length) return false;
+    return crypto.timingSafeEqual(a,b);
+  }catch{ return false; }
+}
+const cleanBase = ()=> String(BASE_URL||'').trim().replace(/^=+/, '');
+
 function makeSignedCompleteUrl({ aid, did='', cid='', ttlSeconds=7*24*60*60 }){
   const exp = Math.floor(Date.now()/1000)+ttlSeconds;
   const raw = `${aid}.${did}.${cid}.${exp}`;
@@ -961,7 +986,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       if (!aJson?.success || !aJson.data) { res.status(200).send('Activity fetch fail'); return; }
       const activity = aJson.data;
 
-      // --- Stabilizer: if someone reverted our subject within the window, re-PUT up to 3x ---
+      // Stabilizer: if someone reverted our subject within the window, re-PUT up to 3x
       try {
         const stab = RENAME_STABILIZER.get(String(activity.id));
         if (stab && Date.now() <= stab.until) {
@@ -980,8 +1005,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       }
 
       dbgRename('activity-fetched', {
-        id: activity.id, subject: activity.subject, type: activity.type,
-        due_date: activity.due_date, due_time: activity.due_time, done: activity.done
+        id: activity.id, subject: activity.subject, due_date: activity.due_date, due_time: activity.due_time, done: activity.done
       });
 
       if (activity.done === true || activity.done === 1) { res.status(200).send('OK'); return; }
@@ -1029,13 +1053,29 @@ expressApp.post('/pipedrive-task', async (req, res) => {
         }
       }
 
-      // === Slack posting is gated by due date (converted to CT) ===
-      if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+      // Record due snapshot & detect FUTURE->TODAY
+      const intoToday = movedIntoToday(activity.id, activity);
+      markLastDue(activity.id, activity);
+
+      // 🚫 Blocked subjects never post
+      if (isSubjectBlocked(activity.subject || '')) { res.status(200).send('OK'); return; }
+
+      // === Date/time gate ===
+      const okByDate = POST_FUTURE_WOS || isDueTodayCT(activity) || intoToday;
+      if (!okByDate) {
         try { await deleteAssigneePost(activity.id); } catch {}
         res.status(200).send('OK');
         return;
       }
-      if (!shouldPostNowStrong(activity, assignee.teamName, deal)) {
+
+      // Hold early-morning posts until 7am CT
+      if (!POST_FUTURE_WOS && isDueTodayCT(activity) && isBefore7amCTNow()) {
+        res.status(200).send('OK');
+        return;
+      }
+
+      // Fingerprint dedup (unless we just moved into today)
+      if (!shouldPostNowStrong(activity, assignee.teamName, deal) && !intoToday) {
         res.status(200).send('OK');
         return;
       }
@@ -1060,7 +1100,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       // fetch full, current deal
       let deal = null;
       try {
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       } catch (e) {
@@ -1070,7 +1110,7 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 
       // list all OPEN activities on this deal (include return_field_key)
       const listRes = await fetch(
-        `https://api/pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
+        `https://api.pipedrive.com/v1/activities?deal_id=${encodeURIComponent(dealId)}&done=0&start=0&limit=50&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.')
       );
       const listJson = await listRes.json();
       const items = (listJson?.data || []).filter(a => a && (a.done === false || a.done === 0));
@@ -1078,7 +1118,13 @@ expressApp.post('/pipedrive-task', async (req, res) => {
       const jobChannelId = await resolveDealChannelId({ allowDefault: ALLOW_DEFAULT_FALLBACK });
 
       for (const activity of items) {
+        // Capture crew from subject BEFORE potential rename to detect reassignment
+        const subjCrewBefore = extractCrewName(activity.subject || '');
+
         const ass = detectAssignee({ deal, activity, allowDealFallback: true });
+
+        // Skip blocked subjects
+        if (isSubjectBlocked(activity.subject || '')) continue;
 
         // ====== SAME RENAME GATE ON DEAL FAN-OUT ======
         try {
@@ -1089,16 +1135,27 @@ expressApp.post('/pipedrive-task', async (req, res) => {
             dbgRename('deal-update-gates', {
               aid: activity.id,
               typeAllowed: isTypeAllowedForRename(activity),
-              inNeverList: false,
               hasTeamName: !!ass.teamName
             });
           }
         } catch (e) { /* ignore */ }
 
         // Posting behavior: only due today (unless POST_FUTURE_WOS)
-        if (!(POST_FUTURE_WOS || isDueTodayCT(activity))) {
+        const okDate = POST_FUTURE_WOS || isDueTodayCT(activity);
+        if (!okDate) {
           try { await deleteAssigneePost(activity.id); } catch {}
           continue;
+        }
+
+        // Hold until 7am CT
+        if (!POST_FUTURE_WOS && isBefore7amCTNow()) continue;
+
+        // If crew changed (based on subject tag vs detected team), allow posting even if not "just touched".
+        const crewChanged = subjCrewBefore && ass.teamName && normalizeName(subjCrewBefore) !== normalizeName(ass.teamName);
+
+        if (!crewChanged) {
+          // Not a reassignment -> only post if recently touched (throttles backlog on silent deal edits)
+          if (!wasJustTouched(activity)) continue;
         }
 
         if (!shouldPostNowStrong(activity, ass.teamName, deal)) continue;
@@ -1137,17 +1194,20 @@ expressApp.post('/pipedrive-task', async (req, res) => {
 /* ========= 7:00 AM CT daily runner ========= */
 expressApp.get('/dispatch/run-7am', async (_req, res) => {
   try {
-    const listRes = await fetch(`https://api/pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const today = DateTime.now().setZone(TZ).toISODate();
+    const listRes = await fetch(`https://api.pipedrive.com/v1/activities?done=0&limit=500&return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const listJson = await listRes.json();
     const all = Array.isArray(listJson?.data) ? listJson.data : [];
-    const dueToday = all.filter(a => isDueTodayCT(a));
+    const dueToday = all.filter(a => (a?.due_date||'').trim() === today);
     dueToday.sort(compareByStartTime);
 
     let posted = 0;
     for (const activity of dueToday) {
+      if (isSubjectBlocked(activity.subject || '')) continue;
+
       let deal = null;
       if (activity.deal_id){
-        const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+        const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
         const dJson = await dRes.json();
         if (dJson?.success && dJson.data) deal = dJson.data;
       }
@@ -1192,7 +1252,7 @@ expressApp.get('/wo/complete', async (req, res) => {
     if (!verify(raw, sig)) { res.status(403).send('Bad signature.'); return; }
 
     const markedAtIso = new Date().toISOString();
-    const pdResp = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
+    const pdResp = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'), {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ done:true, marked_as_done_time: markedAtIso })
     });
@@ -1201,13 +1261,13 @@ expressApp.get('/wo/complete', async (req, res) => {
 
     let activity = null, deal = null, dealTitle='N/A', typeOfService='N/A', location='N/A';
     try {
-      const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const aJson = await aRes.json();
       if (aJson?.success && aJson.data) {
         activity = aJson.data;
         const dealId = did || activity.deal_id;
         if (dealId) {
-          const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const dJson = await dRes.json();
           if (dJson?.success && dJson.data) {
             deal = dJson.data;
@@ -1265,7 +1325,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
   try{
     const aid = req.query.aid;
     if(!aid) { res.status(400).send('Missing aid'); return; }
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aj = await aRes.json();
     if (!aj?.success || !aj.data) { res.status(404).send('Activity not found'); return; }
     const data = aj.data;
@@ -1274,7 +1334,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
     let dealTitle='N/A', typeOfService='N/A', location='N/A', assigneeName=null, deal=null, customerName=null;
     const dealId = data.deal_id;
     if (dealId){
-      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(dealId)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dj = await dRes.json();
       if (dj?.success && dj.data){
         deal = dj.data;
@@ -1286,7 +1346,7 @@ expressApp.get('/wo/pdf', async (req,res)=>{
         assigneeName = ass.teamName || assigneeName;
         const pid = deal?.person_id?.value || deal?.person_id?.id || deal?.person_id;
         if (pid) {
-          const pres = await fetch(`https://api/pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+          const pres = await fetch(`https://api.pipedrive.com/v1/persons/${encodeURIComponent(pid)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
           const pjson = await pres.json();
           if (pjson?.success && pjson.data) customerName = pjson.data.name || null;
         }
@@ -1309,13 +1369,13 @@ expressApp.get('/wo/pdf', async (req,res)=>{
 expressApp.get('/debug/aid/:aid', async (req, res) => {
   try {
     const { aid } = req.params;
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).json({ ok:false, error:'not found' });
     const activity = aJson.data;
     let deal = null;
     if (activity.deal_id) {
-      const dRes = await fetch(`https://api/pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+      const dRes = await fetch(`https://api.pipedrive.com/v1/deals/${encodeURIComponent(activity.deal_id)}?api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
       const dJson = await dRes.json(); deal = dJson?.data || null;
     }
     const ass = detectAssignee({ deal, activity, allowDealFallback: true });
@@ -1324,8 +1384,6 @@ expressApp.get('/debug/aid/:aid', async (req, res) => {
       subject: activity.subject,
       due_date: activity.due_date,
       due_time: activity.due_time,
-      type: activity.type,
-      parsed_ct: parseDueDateTimeCT(activity),
       assignee: ass,
       source: ass?._source,
     });
@@ -1339,7 +1397,7 @@ expressApp.post('/debug/rename', express.json(), async (req, res) => {
   try {
     const { aid, to } = req.body || {};
     if (!aid || !to) return res.status(400).send('aid and to required');
-    const aRes = await fetch(`https://api/pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
+    const aRes = await fetch(`https://api.pipedrive.com/v1/activities/${encodeURIComponent(aid)}?return_field_key=1&api_token=${PIPEDRIVE_API_TOKEN}`.replace('api/','api.'));
     const aJson = await aRes.json();
     if (!aJson?.success || !aJson.data) return res.status(404).send('activity not found');
     const cur = aJson.data.subject || '';
