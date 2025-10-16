@@ -239,7 +239,7 @@ const SERVICE_MAP = {
 const PRODUCTION_TEAM_MAP = {
   47: "Kings",
   48: "Johnathan",
-  49: "Pena",
+  49: "Tevin",
   50: "Hector",
   51: "Sebastian",
   52: "Anastacio",
@@ -259,7 +259,7 @@ const DEAL_ADDRESS_KEY          = process.env.DEAL_ADDRESS_KEY || 'd204334da759b
 
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
-  47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09ASBE36Q7', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
+  47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09L6MVGPE2', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
   52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE',
   57: 'C09B85LE544', 58: 'C09EQNJN960', 59: null, 60: null
 };
