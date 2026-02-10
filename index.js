@@ -237,17 +237,17 @@ const SERVICE_MAP = {
 };
 
 const PRODUCTION_TEAM_MAP = {
-  47: "Kings",
-  48: "Johnathan",
+  47: "Simon",
+  48: "Erik",
   49: "Tevin",
   50: "Hector",
   51: "Rebecca",
   52: "Anastacio",
   53: "Mike",
   54: "Gary",
-  55: "Greg",
+  55: "Derek",
   56: "Amber",
-  57: "Anna Marie",
+  57: "Brendon",
   58: "Rosemary",
   59: "Slot 4",
   60: "Slot 5"
@@ -259,9 +259,9 @@ const DEAL_ADDRESS_KEY          = process.env.DEAL_ADDRESS_KEY || 'd204334da759b
 
 // Production Team enum ID → Slack channel
 const PRODUCTION_TEAM_TO_CHANNEL = {
-  47: 'C09BXCCD95W', 48: 'C09ASB1N32B', 49: 'C09L6MVGPE2', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
-  52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C09BFFGBYTB', 56: 'C09B49MJHEE',
-  57: 'C09B85LE544', 58: 'C09EQNJN960', 59: null, 60: null
+  47: 'C09ASB1N32B', 48: 'C0AEHQ0Q1B3', 49: 'C09L6MVGPE2', 50: 'C09B6P5LVPY', 51: 'C09AZ6VT459',
+  52: 'C09BA0XUAV7', 53: 'C098H8GU355', 54: 'C09AZ63JEJF', 55: 'C0AE4SNCC1Y', 56: 'C09B49MJHEE',
+  57: 'C0A9XC1UZBN', 58: 'C09EQNJN960', 59: null, 60: null
 };
 
 // 🔁 Name → ID map (to resolve label-only enum values)
